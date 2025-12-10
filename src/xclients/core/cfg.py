@@ -14,6 +14,5 @@ def spec(tree: dict[str, jax.Array] | jax.Array):
 
 @dataclass
 class Config:
-    host: str = "127.0.0.1"
-    port: int = 8080
-    show: bool = False
+    port: int
+    host: str
