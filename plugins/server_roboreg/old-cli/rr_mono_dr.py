@@ -1,18 +1,20 @@
+from __future__ import annotations
+
 import argparse
+from enum import Enum
 import importlib
 import os
-from enum import Enum
 
 import cv2
 import numpy as np
 import pytorch_kinematics as pk
 import rich
 import rich.progress
-import torch
 from roboreg.io import find_files, parse_mono_data
 from roboreg.losses import soft_dice_loss
 from roboreg.util import mask_distance_transform, mask_exponential_decay, overlay_mask
 from roboreg.util.factories import create_robot_scene, create_virtual_camera
+import torch
 
 
 class REGISTRATION_MODE(Enum):
@@ -67,25 +69,25 @@ def args_factory() -> argparse.Namespace:
     parser.add_argument(
         "--ros-package",
         type=str,
-        default="lbr_description",
+        default="xarm_description",
         help="Package where the URDF is located.",
     )
     parser.add_argument(
         "--xacro-path",
         type=str,
-        default="urdf/med7/med7.xacro",
+        default="urdf/xarm_device.urdf.xacro",
         help="Path to the xacro file, relative to --ros-package.",
     )
     parser.add_argument(
         "--root-link-name",
         type=str,
-        default="",
+        default="link_base",
         help="Root link name. If unspecified, the first link with mesh will be used, which may cause errors.",
     )
     parser.add_argument(
         "--end-link-name",
         type=str,
-        default="",
+        default="link7",
         help="End link name. If unspecified, the last link with mesh will be used, which may cause errors.",
     )
     parser.add_argument(
@@ -193,12 +195,8 @@ def main() -> None:
     # enable gradient tracking and instantiate optimizer
     extrinsics_9d_inv = pk.matrix44_to_se3_9d(extrinsics_inv)
     extrinsics_9d_inv.requires_grad = True
-    optimizer = getattr(importlib.import_module("torch.optim"), args.optimizer)(
-        [extrinsics_9d_inv], lr=args.lr
-    )
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer, step_size=args.step_size, gamma=args.gamma
-    )
+    optimizer = getattr(importlib.import_module("torch.optim"), args.optimizer)([extrinsics_9d_inv], lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=args.gamma)
     best_extrinsics = extrinsics
     best_extrinsics_inv = extrinsics_inv
     best_loss = float("inf")
