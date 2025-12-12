@@ -12,13 +12,13 @@ import jax
 import numpy as np
 from rich import print
 from tqdm import tqdm
-from triangulate import batch_triangulate
 import tyro
 from webpolicy.client import Client
 
 import xclients
 from xclients.core import tf as xctf
 from xclients.core.cfg import Config, spec
+from xclients.triangulate import batch_triangulate
 
 log = logging.getLogger(__name__)
 
