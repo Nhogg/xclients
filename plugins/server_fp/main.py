@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 import sys
 import traceback
@@ -15,6 +14,8 @@ import tyro
 from webpolicy.base_policy import BasePolicy
 from webpolicy.server import Server
 
+from xclients.core.cfg import Config
+
 PLUGIN_DIR = Path(__file__).resolve().parent
 REPO_ROOT = PLUGIN_DIR.parent.parent
 FP_ROOT = REPO_ROOT / "external" / "foundation_pose"
@@ -24,13 +25,6 @@ if str(FP_ROOT) not in sys.path:
 
 from datareader import YcbineoatReader
 from estimater import FoundationPose, PoseRefinePredictor, ScorePredictor
-
-
-@dataclass
-class Config:
-    host: str = "0.0.0.0"
-    port: int = 8082
-    device: str | None = None
 
 
 class Schema(BaseModel):
@@ -54,8 +48,8 @@ RequestPayload = Annotated[TrackRequest | HealthRequest, Field(discriminator="ty
 
 
 class FoundationPosePolicy(BasePolicy):
-    def __init__(self, device: str | None = None):
-        self.device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+    def __init__(self):
+        self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
         self.estimator = None
         self.current_mesh_path = None
 
@@ -157,7 +151,7 @@ class FoundationPosePolicy(BasePolicy):
 
 def main(cfg: Config) -> None:
     print(f"Starting FoundationPose Server on {cfg.host}:{cfg.port}...")
-    policy = FoundationPosePolicy(device=cfg.device)
+    policy = FoundationPosePolicy()
     server = Server(policy, cfg.host, cfg.port)
     server.serve()
 
