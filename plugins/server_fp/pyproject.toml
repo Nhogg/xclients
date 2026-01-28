@@ -1,0 +1,52 @@
+[project]
+name = "server_fp"
+version = "0.1.0"
+description = "FoundationPose Server Plugin"
+requires-python = ">=3.11"
+dependencies = [
+    # --- Core & Server ---
+    "torch",
+    "numpy",
+    "opencv-python",
+    "pydantic",
+    "msgpack",
+    "msgpack-numpy",
+    "fastapi",
+    "uvicorn",
+    "typer",
+    "webpolicy",
+
+    "ruamel.yaml",       
+    "hydra-core",        
+    "omegaconf",         
+    "h5py",              
+    "trimesh",           
+    "scipy",             
+    "pyrender",          
+    "matplotlib",        
+    "scikit-image",      
+    "tqdm",              
+    "transforms3d",      
+    "open3d",            
+    "imageio",           
+    "pyglet<2",          
+    "psutil",
+    "torchvision",
+    "transformations",
+    "kornia",
+    "ninja",
+    "pytorch3d @ git+https://github.com/facebookresearch/pytorch3d.git",
+    "nvdiffrast @ git+https://github.com/NVlabs/nvdiffrast.git"
+]
+
+
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+webpolicy = { git = "https://github.com/mhyatt000/webpolicy" }
+
+[tool.uv.extra-build-dependencies]
+pytorch3d = ["torch"]
+nvdiffrast = ["torch"]
