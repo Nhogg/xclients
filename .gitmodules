@@ -7,6 +7,3 @@
 [submodule "external/roboreg"]
 	path = external/roboreg
 	url = https://github.com/lbr-stack/roboreg
-[submodule "external/foundation_pose"]
-	path = external/foundation_pose
-	url = https://github.com/NVlabs/FoundationPose.git
