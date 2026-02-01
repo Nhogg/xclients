@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass 
-from pathlib import path 
+from pathlib import Path 
 
 import tyro
 from xclients.core.cfg import Config
