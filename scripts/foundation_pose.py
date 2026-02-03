@@ -55,7 +55,12 @@ def main(cfg: FPConfig) -> None:
     }
 
     try:
-        response = client.step(payload)
+        #response = client.step(payload)
+        while True:
+            response = client.step({"type": "next_frame"})
+            if response.get("status") == "finished":
+                break
+            print(f"Pose: {response.get('pose')}")
         
         if not response:
             logging.error("No response received from server.")
