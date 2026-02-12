@@ -1,9 +1,10 @@
-import os
-import sys
+from __future__ import annotations
 
-import tyro
+import os
+
 from rich import print
-from server import Config, Policy
+from server_sam3do.server import Config, Policy
+import tyro
 from webpolicy.server import Server
 
 
