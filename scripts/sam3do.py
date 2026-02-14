@@ -11,15 +11,37 @@ from webpolicy.client import Client
 
 from xclients.core.cfg import Config, spec
 
-
 @dataclass
 class SAMConfig(Config):
-    pass
-    # prompt: str | None = None
-    # confidence: float = 0.5
+    """Config for SAM3 server"""
+    host: str = "localhost"
+    port: int = 8000
+    prompt: str | "object"
+    image_path: Path = None
 
+@dataclass
+class CameraInput:
+    """Config for camera input"""
+    device: int = 0
+    show: bool = True
+
+@dataclass ImageInput:
+    """Config for image input"""
+    image_path: Path = None
+
+@dataclass
+class SAM3DoConfig(Config):
+    """Config for SAM3Do server"""
+    host: str = "localhost"
+    port: int = 8000
+    input_source: Union[CameraInput, ImageInput] = tyro.MISSING
+    sam3: SAMConfig = SAMConfig()
     # def __post_init__(self):
     # assert self.prompt is not None, "Prompt must be provided for SAM model."
+
+def main(cfg: SAM3DoConfig) -> None:
+    sam3_client = Client(cfg.sam3.host, cfg.sam3.port)
+    sam3do_client = Client(cfg.host, cfg.port)
 
 
 def main(cfg: SAMConfig) -> None:
