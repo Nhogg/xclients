@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from enum import Enum
 import logging
-from typing import Dict
+from typing import Dict, missing, Union Optional
 import time
 
 import cv2
@@ -15,27 +15,29 @@ from webpolicy import msgpack_numpy
 
 from xclients.core.cfg import Config, spec
 
-class InputType(str, Enum):
-    CAMERA = "camera"
-    IMAGE = "image"
+@dataclass
+class CameraInput:
+    """Configuration for camera input"""
+    device: int = 0
 
 @dataclass
-class SAMConfig(Config):
+class ImageInput:
+    """Configuration for image file input"""
+    image_path: Path
+
+@dataclass SAMConfig(Config):
     """Config for SAM3 server"""
     host: str = "localhost"
     port: int = 8000
     prompt: str = "object"
-    image_path: Path | None = None
 
 @dataclass
 class SAM3DoConfig(Config):
     """Config for SAM3Do server"""
     host: str = "localhost"
-    port: int = 8003
-    input_type: InputType = InputType.CAMERA
-    camera_device: int = 0
-    image_path: Path | None = None
-    show: bool = True
+    port: int = 8001
+    input_source: Union[CameraInput, ImageInput] = Tyro.MISSING
+    show: bool = False
     timeout: float = 60.0  # Timeout for server processing
     sam3: SAMConfig = field(default_factory=SAMConfig)
 
@@ -84,16 +86,14 @@ def load_image(image_path: Path) -> np.ndarray:
         raise FileNotFoundError(f"Image file not found: {image_path}")
     
     img = cv2.imread(str(image_path))
-    if img is None:
-        raise ValueError(f"Failed to load image from {image_path}")
     
     logging.info(f"Loaded image with shape: {img.shape}")
     return img
 
-def get_frame(cfg: SAM3DoConfig) -> np.ndarray:
+def get_frame(cfg: SAM3DoConfig, cap: Optional[cv2.VideoCapture]) -> np.ndarray:
     """Get a frame from either camera or image file"""
     if cfg.input_type == InputType.CAMERA:
-        cap = cv2.VideoCapture(cfg.camera_device)
+        
         ret, frame = cap.read()
         cap.release()
         if not ret:
@@ -108,13 +108,17 @@ def main(cfg: SAM3DoConfig) -> None:
     # Create clients with extended timeouts
     sam3do_client = CustomClient(cfg.host, cfg.port, timeout=cfg.timeout + 30)
     sam3_client = CustomClient(cfg.sam3.host, cfg.sam3.port, timeout=30.0)
-    
+   
+    cap: Optional[cv2.VideoCapture] = None
+    if isinstance(cfg.input_source, CameraInput):
+        cap = cv2.VideoCapture(cfg.input_source.device)
+
     logging.info("Starting SAM3Do orchestration")
     
     while True:
         try:
             # Get frame from input source
-            frame = get_frame(cfg)
+            frame = get_frame(cfg, cap)
             
             # Send to SAM3 first
             sam3_payload = {
