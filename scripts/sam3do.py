@@ -33,6 +33,7 @@ class SAM3DoConfig(Config):
     image_path: Path | None = None
     show: bool = True
     sam3: SAMConfig = field(default_factory=SAMConfig)
+    timeout: float = 5.0
 
 def load_image(image_path: Path) -> np.ndarray:
     """Load image from file"""
@@ -86,7 +87,8 @@ def main(cfg: SAM3DoConfig) -> None:
             sam3do_payload = {
                 "image": frame,
                 "mask": frame[..., 0],
-                "type": "image",
+                "type": "image" ,
+                "timeout": cfg.timeout,
             }
             logging.info(f"Sending to SAM3Do: {spec(sam3do_payload)}")
             sam3do_out = sam3do_client.step(sam3do_payload)
