@@ -172,14 +172,17 @@ def save_results(frame: np.ndarray, output: dict, cfg: SAM3DoConfig, frame_idx: 
             logging.info("Saved SAM3 mask and masked image")
     
     # Save pointmap visualization if available
-    p = output["pointmap"]
-        
-    # Handle different pointmap shapes
-    mu, std = p.mean(), p.std()
-    p = (p - mu) / (std + 1e-8)  # Normalize to zero mean and unit variance
-    p = (p+1) / 2  # Scale to [0, 1]
-    p = (p * 255).astype(np.uint8)
-    cv2.imwrite(str(result_dir / "pointmap.png"), cv2.cvtColor(p, cv2.COLOR_RGB2BGR))
+    if "pointmap" in output:
+        p = output["pointmap"]
+            
+        # Handle different pointmap shapes
+        mu, std = p.mean(), p.std()
+        p = (p - mu) / (std + 1e-8)  # Normalize to zero mean and unit variance
+        p = (p+1) / 2  # Scale to [0, 1]
+        p = (p * 255).astype(np.uint8)
+        cv2.imwrite(str(result_dir / "pointmap.png"), cv2.cvtColor(p, cv2.COLOR_RGB2BGR))
+    else:
+        logging.warning("No pointmap in output")
 
     # Save pointmap colors if available
     if "pointmap_colors" in output:
@@ -254,62 +257,101 @@ def render_sam3do_output(renderer, frame, sam3do_out, results_dir, frame_idx, cf
             logging.warning("No mesh in SAM3Do output, skipping rendering")
             return
         
-        mesh_list = sam3do_out["mesh"]
-        if not mesh_list or len(mesh_list) == 0:
-            logging.warning("Mesh list is empty")
-            return
+        mesh_data = sam3do_out["mesh"]
+        logging.info(f"Mesh type: {type(mesh_data)}")
         
-        mesh_result = mesh_list[0]  # Get first mesh result
-        logging.info(f"Mesh type: {type(mesh_result)}")
-        
-        # Extract vertices and faces from MeshExtractResult
-        if hasattr(mesh_result, 'vertices') and hasattr(mesh_result, 'faces'):
-            vertices = mesh_result.vertices
-            faces = mesh_result.faces
-            
-            # Convert to numpy if needed
-            if hasattr(vertices, 'cpu'):
-                vertices = vertices.cpu().numpy()
+        # Handle mesh as dict (from server) or as object (from direct inference)
+        if isinstance(mesh_data, dict):
+            # Server sends mesh as dict with vertices and faces
+            vertices = np.array(mesh_data["vertices"])
+            faces = np.array(mesh_data["faces"])
+        elif isinstance(mesh_data, list):
+            # Direct inference returns list of MeshExtractResult objects
+            if len(mesh_data) == 0:
+                logging.warning("Mesh list is empty")
+                return
+            mesh_obj = mesh_data[0]
+            if hasattr(mesh_obj, 'vertices') and hasattr(mesh_obj, 'faces'):
+                vertices = mesh_obj.vertices
+                faces = mesh_obj.faces
+                # Convert to numpy if needed
+                if hasattr(vertices, 'cpu'):
+                    vertices = vertices.cpu().numpy()
+                else:
+                    vertices = np.array(vertices)
+                if hasattr(faces, 'cpu'):
+                    faces = faces.cpu().numpy()
+                else:
+                    faces = np.array(faces)
             else:
-                vertices = np.array(vertices)
-            
-            if hasattr(faces, 'cpu'):
-                faces = faces.cpu().numpy()
-            else:
-                faces = np.array(faces)
+                logging.error(f"Mesh object doesn't have vertices/faces. Available: {dir(mesh_obj)}")
+                return
         else:
-            logging.error(f"MeshExtractResult doesn't have expected attributes. Available: {dir(mesh_result)}")
+            logging.error(f"Unexpected mesh format: {type(mesh_data)}")
             return
         
         # Set renderer faces
         renderer.faces = faces
         
         # Extract transformation parameters
-        translation = np.array(sam3do_out["translation"]["value"][0]).astype(np.float32)
-        scale_val = np.array(sam3do_out["scale"]["value"][0][0]).astype(np.float32)
+        translation = np.array(sam3do_out["translation"][0]).astype(np.float32)
+        scale_val = np.array(sam3do_out["scale"][0][0]).astype(np.float32)
+        rotation_quat = np.array(sam3do_out["rotation"][0]).astype(np.float32)  # [w, x, y, z] quaternion
+        
+        # Check if intrinsics are available and use them
+        if "intrinsics" in sam3do_out:
+            intrinsics = np.array(sam3do_out["intrinsics"])
+            if intrinsics.ndim == 2:
+                focal_length_x = intrinsics[0, 0]
+                focal_length_y = intrinsics[1, 1]
+                # Use average of fx and fy
+                renderer.focal_length = (focal_length_x + focal_length_y) / 2.0
+                logging.info(f"Using intrinsics from server: fx={focal_length_x}, fy={focal_length_y}, avg={renderer.focal_length}")
         
         logging.info(f"Mesh: vertices {vertices.shape}, faces {faces.shape}")
-        logging.info(f"Transform: translation {translation}, scale {scale_val}")
+        logging.info(f"Transform: translation {translation}, scale {scale_val}, rotation {rotation_quat}")
+        logging.info(f"Renderer focal_length: {renderer.focal_length}")
         
-        # Apply scale to vertices
+        # Convert quaternion to rotation matrix
+        # SAM3D uses [w, x, y, z] format, scipy uses [x, y, z, w]
+        from scipy.spatial.transform import Rotation as R
+        quat_scipy = np.array([rotation_quat[1], rotation_quat[2], rotation_quat[3], rotation_quat[0]])  # Convert to scipy format
+        rot_matrix = R.from_quat(quat_scipy).as_matrix()
+        
+        # SAM3D outputs are in PyTorch3D coordinate system
+        # The renderer.py applies a 180° flip around X at line 209, which converts Y-up to Y-down
+        # So we should only flip X coordinate, not Y
+        
+        # Apply transformations: scale then rotate
         vertices_scaled = vertices * scale_val
+        vertices_rotated = vertices_scaled @ rot_matrix.T
         
-        # Render mesh on original frame
+        # Apply coordinate flip: Only flip X (not Y, since renderer handles that)
+        vertices_opencv = vertices_rotated.copy()
+        vertices_opencv[:, 0] *= -1  # Flip X only
+        
+        # Same for translation
+        translation_opencv = translation.copy()
+        translation_opencv[0] *= -1  # Flip X only
+        
+        logging.info(f"Translation before flip: {translation}, after flip: {translation_opencv}")
+        
+        # Render mesh on original frame with blue color for better visibility
         rendered_img = renderer(
-            vertices=vertices_scaled,
-            cam_t=translation,
+            vertices=vertices_opencv,
+            cam_t=translation_opencv,
             image=frame,
-            mesh_base_color=(1.0, 1.0, 0.9),
+            mesh_base_color=(0.2, 0.5, 1.0),  # Blue color (R, G, B)
             scene_bg_color=(0, 0, 0),
             return_rgba=False,
         )
         
         # Also render standalone RGBA view
         rendered_rgba = renderer.render_rgba(
-            vertices=vertices_scaled,
-            cam_t=translation,
+            vertices=vertices_opencv,
+            cam_t=translation_opencv,
             rot_angle=0,
-            mesh_base_color=(1.0, 1.0, 0.9),
+            mesh_base_color=(0.2, 0.5, 1.0),  # Blue color
             render_res=[640, 480],
         )
         
@@ -332,9 +374,18 @@ def render_sam3do_output(renderer, frame, sam3do_out, results_dir, frame_idx, cf
 def main(cfg: SAM3DoConfig) -> None:
     """Create clients with extended timeout and run inference loop"""
     import cv2
+    from datetime import datetime
     
     sam3do_client = CustomClient(cfg.host, cfg.port, timeout=cfg.timeout + 30)
     sam3_client = CustomClient(cfg.sam3.host, cfg.sam3.port, timeout=30.0)
+
+    # Initialize renderer ONCE before the loop
+    # Use a more appropriate focal length based on image size
+    # Typical webcam has FOV ~60-70 degrees, for 640px width: f ≈ width / (2 * tan(FOV/2))
+    # For FOV=60°: f ≈ 640 / (2 * tan(30°)) ≈ 554
+    focal_length = 554  # Better default for webcam
+    renderer = Renderer(focal_length=focal_length)
+    logging.info(f"Initialized renderer with focal_length={focal_length}")
 
     cap: Optional[cv2.VideoCapture] = None
     if isinstance(cfg.input_source, CameraInput):
@@ -355,9 +406,7 @@ def main(cfg: SAM3DoConfig) -> None:
         }
         logging.info(f"Sending to SAM3...")
         sam3_out = sam3_client.step(sam3_payload)
-        print(sam3_out["masks"].shape)
-        print(sam3_out["masks"].dtype)
-        print(spec(sam3_out))
+        
         if not sam3_out:
             logging.error("No output received from SAM3 server")
             continue
@@ -365,7 +414,8 @@ def main(cfg: SAM3DoConfig) -> None:
         logging.info(f"Received output from SAM3: {sam3_out.keys()}")
         
         mask = sam3_out['masks']
-        mask = mask.sum(axis=(0, 1)).astype(np.bool)        
+        mask = mask.sum(axis=(0, 1)).astype(np.bool_)  # Fixed: np.bool_ instead of np.bool
+        
         # Send to SAM3Do with timeout parameter
         sam3do_payload = {
             "image": frame,
@@ -382,8 +432,17 @@ def main(cfg: SAM3DoConfig) -> None:
         
         logging.info(f"Received output from SAM3Do: {sam3do_out.keys()}")
         
+        # Check if mesh is in output and what it contains
+        if "mesh" in sam3do_out:
+            logging.info(f"Mesh type: {type(sam3do_out['mesh'])}")
+            if isinstance(sam3do_out['mesh'], list):
+                logging.info(f"Mesh list length: {len(sam3do_out['mesh'])}")
+                if len(sam3do_out['mesh']) > 0:
+                    logging.info(f"First mesh item type: {type(sam3do_out['mesh'][0])}")
+        
         # Save results
-        results_dir = save_results(frame, sam3do_out, cfg, frame_idx, mask=mask)
+        results_dir = Path(f"sam3do_results/result_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{frame_idx}")
+        save_results(frame, sam3do_out, cfg, frame_idx, mask=mask)
         
         # Log the results
         for key, value in sam3do_out.items():
@@ -393,12 +452,14 @@ def main(cfg: SAM3DoConfig) -> None:
                 logging.info(f"  {key}: shape={value.shape}, dtype={value.dtype}")
             elif isinstance(value, (int, float, str)):
                 logging.info(f"  {key}: {value}")
+            elif isinstance(value, list):
+                logging.info(f"  {key}: list of {len(value)} items")
             else:
                 logging.info(f"  {key}: {type(value)}")
 
-        focal_length = 600  # Adjust based on your camera
-        renderer = Renderer(focal_length=focal_length)
-        render_sam3do_output(Renderer, frame, sam3do_out, results_dir, frame_idx, cfg)
+        # Render the output - FIX: pass renderer instance, not the class
+        render_sam3do_output(renderer, frame, sam3do_out, results_dir, frame_idx, cfg)
+        
         # Display if needed
         if cfg.show:
             cv2.imshow("Input Frame", frame)
