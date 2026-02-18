@@ -1,3 +1,4 @@
+import jax
 from dataclasses import dataclass, field
 from pathlib import Path
 from enum import Enum
@@ -14,6 +15,11 @@ from webpolicy.client import Client
 from webpolicy import msgpack_numpy
 
 from xclients.core.cfg import Config, spec
+
+
+def spec(tree) -> dict:
+    return jax.tree.map(lambda x: (x.shape, x.dtype), tree)
+
 
 @dataclass
 class CameraInput:
@@ -165,31 +171,15 @@ def save_results(frame: np.ndarray, output: dict, cfg: SAM3DoConfig, frame_idx: 
             logging.info("Saved SAM3 mask and masked image")
     
     # Save pointmap visualization if available
-    if "pointmap" in output:
-        pointmap = output["pointmap"]
-        if pointmap.size > 0:
-            logging.info(f"Pointmap shape: {pointmap.shape}, dtype: {pointmap.dtype}, min: {np.min(pointmap)}, max: {np.max(pointmap)}")
-            
-            # Handle different pointmap shapes
-            if pointmap.ndim == 3:  # (H, W, C)
-                if pointmap.shape[2] == 3:  # RGB
-                    pointmap_vis = (pointmap * 255).astype(np.uint8)
-                    pointmap_vis = cv2.cvtColor(pointmap_vis, cv2.COLOR_RGB2BGR)
-                else:
-                    # If it has more channels, just take first 3
-                    pointmap_vis = (pointmap[..., :3] * 255).astype(np.uint8)
-                    pointmap_vis = cv2.cvtColor(pointmap_vis, cv2.COLOR_RGB2BGR)
-            elif pointmap.ndim == 2:  # Grayscale
-                pointmap_vis = (pointmap * 255).astype(np.uint8)
-            else:
-                logging.warning(f"Unexpected pointmap shape: {pointmap.shape}")
-                pointmap_vis = None
-            
-            if pointmap_vis is not None:
-                cv2.imwrite(str(result_dir / "pointmap.png"), pointmap_vis)
-        else:
-            logging.warning("Empty pointmap, skipping")
-    
+    p = output["pointmap"]
+        
+    # Handle different pointmap shapes
+    mu, std = p.mean(), p.std()
+    p = (p - mu) / (std + 1e-8)  # Normalize to zero mean and unit variance
+    p = (p+1) / 2  # Scale to [0, 1]
+    p = (p * 255).astype(np.uint8)
+    cv2.imwrite(str(result_dir / "pointmap.png"), cv2.cvtColor(p, cv2.COLOR_RGB2BGR))
+
     # Save pointmap colors if available
     if "pointmap_colors" in output:
         pointmap_colors = output["pointmap_colors"]
@@ -279,47 +269,15 @@ def main(cfg: SAM3DoConfig) -> None:
         sam3_out = sam3_client.step(sam3_payload)
         print(sam3_out["masks"].shape)
         print(sam3_out["masks"].dtype)
+        print(spec(sam3_out))
         if not sam3_out:
             logging.error("No output received from SAM3 server")
             continue
         
         logging.info(f"Received output from SAM3: {sam3_out.keys()}")
         
-        # Extract mask from SAM3 output
-        mask = None
-        if "masks" in sam3_out:
-            masks = sam3_out["masks"]
-            logging.info(f"SAM3 masks shape: {masks.shape}, dtype: {masks.dtype}")
-            
-            # Check if masks array is empty
-            if masks.shape[0] == 0:
-                logging.warning("SAM3 detected no masks for the prompt, using full white mask")
-                mask = np.ones((frame.shape[0], frame.shape[1]), dtype=np.uint8) * 255
-            else:
-                # Flatten mask to 2D (H, W)
-                if masks.ndim == 4:  # (N, 1, H, W)
-                    mask = masks[0, 0]  # Take first mask, first channel
-                elif masks.ndim == 3:  # (N, H, W)
-                    mask = masks[0]  # Use first mask
-                else:  # (H, W)
-                    mask = masks
-                
-                # Convert boolean mask to uint8 (0 or 255)
-                if mask.dtype == bool:
-                    mask = (mask.astype(np.uint8)) * 255
-                else:
-                    mask = mask.astype(np.uint8)
-                
-                # Dilate mask to fill small holes and create more points for SAM3Do
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-                mask = cv2.dilate(mask, kernel, iterations=2)
-                print("Dilated mask shape:", mask.shape)
-                print("Dilated mask dtype:", mask.dtype)
-                logging.info(f"Selected mask shape: {mask.shape}, dtype: {mask.dtype}")
-        else:
-            logging.warning("No masks in SAM3 output, using full white mask")
-            mask = np.ones((frame.shape[0], frame.shape[1]), dtype=np.uint8) * 255
-        
+        mask = sam3_out['masks']
+        mask = mask.sum(axis=(0, 1)).astype(np.bool)        
         # Send to SAM3Do with timeout parameter
         sam3do_payload = {
             "image": frame,

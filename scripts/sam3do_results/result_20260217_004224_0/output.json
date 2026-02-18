@@ -1,3 +1,0 @@
-{
-  "error": "max(): Expected reduction dim to be specified for input.numel() == 0. Specify the reduction dim with the 'dim' argument."
-}
