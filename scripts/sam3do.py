@@ -6,6 +6,10 @@ import logging
 from typing import Dict, Union, Optional
 import time
 
+
+import json
+from datetime import datetime
+import numpy as np
 import cv2
 import numpy as np
 from rich import print
@@ -20,7 +24,6 @@ from xclients.core.cfg import Config, spec
 
 def spec(tree) -> dict:
     return jax.tree.map(lambda x: (x.shape, x.dtype), tree)
-
 
 @dataclass
 class CameraInput:
@@ -107,10 +110,6 @@ def get_frame(cfg: SAM3DoConfig, cap: Optional[cv2.VideoCapture]) -> np.ndarray:
     else:  # InputType.IMAGE
         return load_image(cfg.input_source.image_path)
 
-import json
-from datetime import datetime
-import numpy as np
-
 def save_results(frame: np.ndarray, output: dict, cfg: SAM3DoConfig, frame_idx: int = 0, mask: np.ndarray = None):
     """Save visualization and raw data from server output"""
     
@@ -126,109 +125,99 @@ def save_results(frame: np.ndarray, output: dict, cfg: SAM3DoConfig, frame_idx: 
     cv2.imwrite(str(result_dir / "original.png"), frame)
     
     # Save SAM3 mask if available
-    if mask is not None:
-        original_shape = mask.shape
-        logging.info(f"Original mask shape: {original_shape}, dtype: {mask.dtype}")
-        
-        # Check for empty mask array first
-        if mask.size == 0 or (mask.ndim == 4 and mask.shape[0] == 0):
-            logging.warning(f"Empty mask array, skipping mask save")
-            mask = None
-        else:
-            # Flatten mask if needed - keep flattening until we get (H, W)
-            while mask.ndim > 2:
-                if mask.shape[0] == 1:
-                    mask = mask[0]  # Remove first dimension if it's 1
-                elif mask.shape[1] == 1:
-                    mask = mask[:, 0]  # Remove second dimension if it's 1
-                else:
-                    mask = mask[0]  # Default: take first element
-            
-            logging.info(f"Processed mask shape: {mask.shape}, dtype: {mask.dtype}, min: {np.min(mask)}, max: {np.max(mask)}")
-            
-            # Normalize mask to 0-255 if needed
-            if mask.dtype == np.float32 or mask.dtype == np.float64:
-                mask_vis = (mask * 255).astype(np.uint8)
-            elif mask.dtype == bool:
-                mask_vis = (mask.astype(np.uint8)) * 255
-            else:
-                mask_vis = mask.astype(np.uint8)
-            
-            cv2.imwrite(str(result_dir / "sam3_mask.png"), mask_vis)
-            
-            # Create masked image (mask multiplied by original)
-            if mask_vis.ndim == 2:
-                # Grayscale mask - expand to 3 channels
-                mask_3channel = np.stack([mask_vis] * 3, axis=-1)
-            else:
-                mask_3channel = mask_vis
-            
-            logging.info(f"Mask_3channel shape: {mask_3channel.shape}, frame shape: {frame.shape}")
-            
-            # Apply mask to original image
-            masked_image = (frame.astype(np.float32) * (mask_3channel.astype(np.float32) / 255.0)).astype(np.uint8)
-            cv2.imwrite(str(result_dir / "masked_image.png"), masked_image)
-            
-            logging.info("Saved SAM3 mask and masked image")
+    original_shape = mask.shape
+    logging.info(f"Original mask shape: {original_shape}, dtype: {mask.dtype}")
     
-    # Save pointmap visualization if available
-    if "pointmap" in output:
-        p = output["pointmap"]
-            
-        # Handle different pointmap shapes
-        mu, std = p.mean(), p.std()
-        p = (p - mu) / (std + 1e-8)  # Normalize to zero mean and unit variance
-        p = (p+1) / 2  # Scale to [0, 1]
-        p = (p * 255).astype(np.uint8)
-        cv2.imwrite(str(result_dir / "pointmap.png"), cv2.cvtColor(p, cv2.COLOR_RGB2BGR))
+        # Check for empty mask array first
+    if mask.size == 0 or (mask.ndim == 4 and mask.shape[0] == 0):
+        mask = None
     else:
-        logging.warning("No pointmap in output")
+        # Flatten mask if needed - keep flattening until we get (H, W)
+        while mask.ndim > 2:
+            if mask.shape[0] == 1:
+                mask = mask[0]  # Remove first dimension if it's 1
+            elif mask.shape[1] == 1:
+                mask = mask[:, 0]  # Remove second dimension if it's 1
+            else:
+                mask = mask[0]  # Default: take first element
+        
+        logging.info(f"Processed mask shape: {mask.shape}, dtype: {mask.dtype}, min: {np.min(mask)}, max: {np.max(mask)}")
+        
+        # Normalize mask to 0-255 if needed
+        if mask.dtype == np.float32 or mask.dtype == np.float64:
+            mask_vis = (mask * 255).astype(np.uint8)
+        elif mask.dtype == bool:
+            mask_vis = (mask.astype(np.uint8)) * 255
+        else:
+            mask_vis = mask.astype(np.uint8)
+        
+        cv2.imwrite(str(result_dir / "sam3_mask.png"), mask_vis)
+        
+        # Create masked image (mask multiplied by original)
+        if mask_vis.ndim == 2:
+            # Grayscale mask - expand to 3 channels
+            mask_3channel = np.stack([mask_vis] * 3, axis=-1)
+        else:
+            mask_3channel = mask_vis
+        
+        logging.info(f"Mask_3channel shape: {mask_3channel.shape}, frame shape: {frame.shape}")
+        
+        # Apply mask to original image
+        masked_image = (frame.astype(np.float32) * (mask_3channel.astype(np.float32) / 255.0)).astype(np.uint8)
+        cv2.imwrite(str(result_dir / "masked_image.png"), masked_image)
+        
+        logging.info("Saved SAM3 mask and masked image")
+
+    # Save pointmap visualization if available
+    p = output["pointmap"]
+        
+    # Handle different pointmap shapes
+    mu, std = p.mean(), p.std()
+    p = (p - mu) / (std + 1e-8)  # Normalize to zero mean and unit variance
+    p = (p+1) / 2  # Scale to [0, 1]
+    p = (p * 255).astype(np.uint8)
+    cv2.imwrite(str(result_dir / "pointmap.png"), cv2.cvtColor(p, cv2.COLOR_RGB2BGR))
 
     # Save pointmap colors if available
-    if "pointmap_colors" in output:
-        pointmap_colors = output["pointmap_colors"]
-        logging.info(f"Pointmap colors shape: {pointmap_colors.shape}, dtype: {pointmap_colors.dtype}")
-        
-        if pointmap_colors.ndim == 3 and pointmap_colors.shape[2] == 3:
-            pointmap_colors_vis = (pointmap_colors * 255).astype(np.uint8)
-            pointmap_colors_bgr = cv2.cvtColor(pointmap_colors_vis, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(str(result_dir / "pointmap_colors.png"), pointmap_colors_bgr)
+    pointmap_colors = output["pointmap_colors"]
+    logging.info(f"Pointmap colors shape: {pointmap_colors.shape}, dtype: {pointmap_colors.dtype}")
     
+    if pointmap_colors.ndim == 3 and pointmap_colors.shape[2] == 3:
+        pointmap_colors_vis = (pointmap_colors * 255).astype(np.uint8)
+        pointmap_colors_bgr = cv2.cvtColor(pointmap_colors_vis, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(str(result_dir / "pointmap_colors.png"), pointmap_colors_bgr)
+
     # Save overlay with 6D rotation visualization
     overlay = frame.copy()
     y_offset = 30
     
-    if "rotation" in output:
-        rotation = output["rotation"]
-        logging.info(f"Rotation shape: {rotation.shape}, value: {rotation}")
-        cv2.putText(overlay, f"Rotation: {rotation.flatten()[:4]}", (10, y_offset),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        y_offset += 30
-        print(f"Rotation: {output['rotation']}")
+    rotation = output["rotation"]
+    logging.info(f"Rotation shape: {rotation.shape}, value: {rotation}")
+    cv2.putText(overlay, f"Rotation: {rotation.flatten()[:4]}", (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    y_offset += 30
+    print(f"Rotation: {output['rotation']}")
 
-    if "6drotation_normalized" in output:
-        rotation_6d = output["6drotation_normalized"]
-        logging.info(f"6D Rotation shape: {rotation_6d.shape}, value: {rotation_6d}")
-        cv2.putText(overlay, f"6D Rot: {rotation_6d.flatten()[:6]}", (10, y_offset),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        y_offset += 30
-        print(f"6D Rotation: {output['6drotation_normalized']}")
-    
-    if "translation" in output:
-        translation = output["translation"]
-        logging.info(f"Translation shape: {translation.shape}, value: {translation}")
-        cv2.putText(overlay, f"Trans: {translation.flatten()}", (10, y_offset),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        y_offset += 30
-        print(f"Translation: {output['translation']}")
-    
-    if "scale" in output:
-        scale = output["scale"]
-        logging.info(f"Scale shape: {scale.shape}, value: {scale}")
-        cv2.putText(overlay, f"Scale: {scale.flatten()}", (10, y_offset),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        print(f"Scale: {output['scale']}")
-    
+    rotation_6d = output["6drotation_normalized"]
+    logging.info(f"6D Rotation shape: {rotation_6d.shape}, value: {rotation_6d}")
+    cv2.putText(overlay, f"6D Rot: {rotation_6d.flatten()[:6]}", (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    y_offset += 30
+    print(f"6D Rotation: {output['6drotation_normalized']}")
+
+    translation = output["translation"]
+    logging.info(f"Translation shape: {translation.shape}, value: {translation}")
+    cv2.putText(overlay, f"Trans: {translation.flatten()}", (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    y_offset += 30
+    print(f"Translation: {output['translation']}")
+
+    scale = output["scale"]
+    logging.info(f"Scale shape: {scale.shape}, value: {scale}")
+    cv2.putText(overlay, f"Scale: {scale.flatten()}", (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    print(f"Scale: {output['scale']}")
+
     cv2.imwrite(str(result_dir / "overlay.png"), overlay)
     
     # Save raw data as JSON
@@ -240,6 +229,16 @@ def save_results(frame: np.ndarray, output: dict, cfg: SAM3DoConfig, frame_idx: 
                 "dtype": str(value.dtype),
                 "data": value.tolist() if value.size < 1000 else "too large to save"
             }
+        elif key == "mesh" and isinstance(value, dict):
+            # Save mesh to separate NPZ file for easier loading
+            if "vertices" in value and "faces" in value:
+                mesh_path = result_dir / "mesh.npz"
+                np.savez(mesh_path, 
+                        vertices=value["vertices"],
+                        faces=value["faces"])
+                data_to_save[key] = f"saved to mesh.npz"
+            else:
+                data_to_save[key] = str(value)
         else:
             data_to_save[key] = str(value)
     
@@ -262,11 +261,9 @@ def render_sam3do_output(renderer, frame, sam3do_out, results_dir, frame_idx, cf
         
         # Handle mesh as dict (from server) or as object (from direct inference)
         if isinstance(mesh_data, dict):
-            # Server sends mesh as dict with vertices and faces
-            vertices = np.array(mesh_data["vertices"])
-            faces = np.array(mesh_data["faces"])
+            vertices = np.array(mesh_data["vertices"], dtype=np.float32)
+            faces = np.array(mesh_data["faces"], dtype=np.int32)
         elif isinstance(mesh_data, list):
-            # Direct inference returns list of MeshExtractResult objects
             if len(mesh_data) == 0:
                 logging.warning("Mesh list is empty")
                 return
@@ -274,15 +271,14 @@ def render_sam3do_output(renderer, frame, sam3do_out, results_dir, frame_idx, cf
             if hasattr(mesh_obj, 'vertices') and hasattr(mesh_obj, 'faces'):
                 vertices = mesh_obj.vertices
                 faces = mesh_obj.faces
-                # Convert to numpy if needed
                 if hasattr(vertices, 'cpu'):
-                    vertices = vertices.cpu().numpy()
+                    vertices = vertices.cpu().numpy().astype(np.float32)
                 else:
-                    vertices = np.array(vertices)
+                    vertices = np.array(vertices, dtype=np.float32)
                 if hasattr(faces, 'cpu'):
-                    faces = faces.cpu().numpy()
+                    faces = faces.cpu().numpy().astype(np.int32)
                 else:
-                    faces = np.array(faces)
+                    faces = np.array(faces, dtype=np.int32)
             else:
                 logging.error(f"Mesh object doesn't have vertices/faces. Available: {dir(mesh_obj)}")
                 return
@@ -294,70 +290,161 @@ def render_sam3do_output(renderer, frame, sam3do_out, results_dir, frame_idx, cf
         renderer.faces = faces
         
         # Extract transformation parameters
-        translation = np.array(sam3do_out["translation"][0]).astype(np.float32)
-        scale_val = np.array(sam3do_out["scale"][0][0]).astype(np.float32)
-        rotation_quat = np.array(sam3do_out["rotation"][0]).astype(np.float32)  # [w, x, y, z] quaternion
+        translation = np.array(sam3do_out["translation"]).flatten().astype(np.float32)
+        scale_val = float(np.array(sam3do_out["scale"]).flatten()[0])
+        rotation_quat = np.array(sam3do_out["rotation"]).flatten().astype(np.float32)  # [w, x, y, z]
         
         # Check if intrinsics are available and use them
+        camera_center = None
         if "intrinsics" in sam3do_out:
             intrinsics = np.array(sam3do_out["intrinsics"])
-            if intrinsics.ndim == 2:
-                focal_length_x = intrinsics[0, 0]
-                focal_length_y = intrinsics[1, 1]
-                # Use average of fx and fy
-                renderer.focal_length = (focal_length_x + focal_length_y) / 2.0
-                logging.info(f"Using intrinsics from server: fx={focal_length_x}, fy={focal_length_y}, avg={renderer.focal_length}")
+            logging.info(f"Intrinsics shape: {intrinsics.shape}, value:\n{intrinsics}")
+            if intrinsics.ndim == 2 and intrinsics.shape[0] >= 2 and intrinsics.shape[1] >= 3:
+                fx = float(intrinsics[0, 0])
+                fy = float(intrinsics[1, 1])
+                cx = float(intrinsics[0, 2])
+                cy = float(intrinsics[1, 2])
+                
+                # Check if intrinsics are normalized (values < 10 are likely normalized)
+                if fx < 10 and fy < 10:
+                    # Denormalize: multiply by image dimensions
+                    h, w = frame.shape[:2]
+                    fx = fx * w
+                    fy = fy * h
+                    cx = cx * w
+                    cy = cy * h
+                    logging.info(f"Intrinsics were normalized, denormalized to pixels")
+                
+                renderer.focal_length = (fx + fy) / 2.0
+                camera_center = [cx, cy]
+                logging.info(f"Using intrinsics: fx={fx:.2f}, fy={fy:.2f}, cx={cx:.2f}, cy={cy:.2f}")
+        else:
+            logging.warning("No intrinsics in output!")
         
-        logging.info(f"Mesh: vertices {vertices.shape}, faces {faces.shape}")
-        logging.info(f"Transform: translation {translation}, scale {scale_val}, rotation {rotation_quat}")
-        logging.info(f"Renderer focal_length: {renderer.focal_length}")
+        logging.info(f"Raw transform - translation: {translation}, scale: {scale_val}, rotation: {rotation_quat}")
+        logging.info(f"Mesh: vertices {vertices.shape}, faces {faces.shape}, min: {vertices.min(axis=0)}, max: {vertices.max(axis=0)}")
+        logging.info(f"Renderer focal_length: {renderer.focal_length}, camera_center: {camera_center}")
         
         # Convert quaternion to rotation matrix
-        # SAM3D uses [w, x, y, z] format, scipy uses [x, y, z, w]
         from scipy.spatial.transform import Rotation as R
-        quat_scipy = np.array([rotation_quat[1], rotation_quat[2], rotation_quat[3], rotation_quat[0]])  # Convert to scipy format
+        # SAM3D uses [w, x, y, z], scipy uses [x, y, z, w]
+        quat_scipy = np.array([rotation_quat[1], rotation_quat[2], rotation_quat[3], rotation_quat[0]])
         rot_matrix = R.from_quat(quat_scipy).as_matrix()
         
-        # SAM3D outputs are in PyTorch3D coordinate system
-        # The renderer.py applies a 180° flip around X at line 209, which converts Y-up to Y-down
-        # So we should only flip X coordinate, not Y
+        # Define coordinate system flip: PyTorch3D (X-right, Y-up) -> OpenCV (X-right, Y-down)
+        # We need to flip X and Y axes
+        coord_flip = np.array([
+            [-1,  0,  0],
+            [ 0, -1,  0],
+            [ 0,  0,  1]
+        ], dtype=np.float32)
         
-        # Apply transformations: scale then rotate
-        vertices_scaled = vertices * scale_val
-        vertices_rotated = vertices_scaled @ rot_matrix.T
+        # Transform rotation to new coordinate system: R_opencv = Flip @ R_pytorch3d @ Flip^T
+        rot_matrix_opencv = coord_flip @ rot_matrix @ coord_flip.T
         
-        # Apply coordinate flip: Only flip X (not Y, since renderer handles that)
-        vertices_opencv = vertices_rotated.copy()
-        vertices_opencv[:, 0] *= -1  # Flip X only
+        # Apply transformations to vertices: scale, rotate (in OpenCV frame), then translate
+        vertices_transformed = vertices * scale_val
+        vertices_transformed = vertices_transformed @ rot_matrix_opencv.T  # Apply rotation in OpenCV frame
         
-        # Same for translation
+        # Flip vertices from PyTorch3D to OpenCV
+        vertices_transformed[:, 0] *= -1  # Flip X
+        vertices_transformed[:, 1] *= -1  # Flip Y
+        
+        # Flip translation from PyTorch3D to OpenCV
         translation_opencv = translation.copy()
-        translation_opencv[0] *= -1  # Flip X only
+        translation_opencv[0] *= -1  # Flip X
+        translation_opencv[1] *= -1  # Flip Y
         
-        logging.info(f"Translation before flip: {translation}, after flip: {translation_opencv}")
+        vertices_transformed = vertices_transformed + translation_opencv  # Apply translation
         
-        # Render mesh on original frame with blue color for better visibility
+        # The renderer expects camera_translation (cam_t), not mesh position
+        # Set cam_t to zero since we've already transformed vertices
+        cam_t = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        
+        logging.info(f"Transformed vertices - min: {vertices_transformed.min(axis=0)}, max: {vertices_transformed.max(axis=0)}")
+        
+        # Render mesh on original frame
         rendered_img = renderer(
-            vertices=vertices_opencv,
-            cam_t=translation_opencv,
+            vertices=vertices_transformed,
+            cam_t=cam_t,
             image=frame,
-            mesh_base_color=(0.2, 0.5, 1.0),  # Blue color (R, G, B)
+            mesh_base_color=(0.2, 0.5, 1.0),  # Blue
             scene_bg_color=(0, 0, 0),
             return_rgba=False,
+            camera_center=camera_center,  # Use intrinsics principal point
         )
         
-        # Also render standalone RGBA view
+        # Also render standalone RGBA view for debugging
         rendered_rgba = renderer.render_rgba(
-            vertices=vertices_opencv,
-            cam_t=translation_opencv,
+            vertices=vertices_transformed,
+            cam_t=np.array([0.0, 0.0, 3.0]),  # Default camera distance for standalone view
             rot_angle=0,
-            mesh_base_color=(0.2, 0.5, 1.0),  # Blue color
+            mesh_base_color=(0.2, 0.5, 1.0),
             render_res=[640, 480],
         )
         
+        # Add visualization overlays
+        rendered_img_vis = (rendered_img * 255).astype(np.uint8).copy()
+        
+        # Draw coordinate axes at mesh origin
+        origin_3d = translation_opencv
+        axes_length = scale_val * 0.5  # Half the scale for visibility
+        axes_3d = {
+            'X': np.array([[0,0,0], [axes_length, 0, 0]]),  # Red
+            'Y': np.array([[0,0,0], [0, axes_length, 0]]),  # Green  
+            'Z': np.array([[0,0,0], [0, 0, axes_length]]),  # Blue
+        }
+        axes_colors = {'X': (0, 0, 255), 'Y': (0, 255, 0), 'Z': (255, 0, 0)}  # BGR format
+        
+        # Project axes to 2D
+        h, w = frame.shape[:2]
+        K = np.array([
+            [fx, 0, cx],
+            [0, fy, cy],
+            [0, 0, 1]
+        ])
+        
+        for axis_name, axis_pts in axes_3d.items():
+            # Transform axis points
+            pts_transformed = axis_pts @ rot_matrix_opencv.T
+            pts_transformed[:, 0] *= -1  # Flip X
+            pts_transformed[:, 1] *= -1  # Flip Y
+            pts_transformed += translation_opencv
+            
+            # Project to 2D
+            pts_2d = []
+            for pt in pts_transformed:
+                if pt[2] > 0:  # In front of camera
+                    uv = K @ pt
+                    uv = uv[:2] / uv[2]
+                    pts_2d.append((int(uv[0]), int(uv[1])))
+            
+            if len(pts_2d) == 2:
+                cv2.line(rendered_img_vis, pts_2d[0], pts_2d[1], axes_colors[axis_name], 3)
+                cv2.circle(rendered_img_vis, pts_2d[1], 5, axes_colors[axis_name], -1)
+        
+        # Calculate and overlay mesh dimensions
+        bbox_min = vertices.min(axis=0)
+        bbox_max = vertices.max(axis=0)
+        mesh_dims = bbox_max - bbox_min
+        mesh_dims_scaled = mesh_dims * scale_val  # In meters
+        
+        # Add text overlay with dimensions
+        text_lines = [
+            f"Dims: {mesh_dims_scaled[0]:.3f}m x {mesh_dims_scaled[1]:.3f}m x {mesh_dims_scaled[2]:.3f}m",
+            f"Scale: {scale_val:.3f}",
+            f"Translation: [{translation[0]:.2f}, {translation[1]:.2f}, {translation[2]:.2f}]",
+            f"Intrinsics: fx={fx:.1f} fy={fy:.1f} cx={cx:.1f} cy={cy:.1f}"
+        ]
+        
+        y_offset = 30
+        for i, line in enumerate(text_lines):
+            cv2.putText(rendered_img_vis, line, (10, y_offset + i*25), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        
         # Save results
         results_dir.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(results_dir / "rendered_on_frame.png"), (rendered_img * 255).astype(np.uint8))
+        cv2.imwrite(str(results_dir / "rendered_on_frame.png"), rendered_img_vis)
         cv2.imwrite(str(results_dir / "rendered_rgba.png"), (rendered_rgba * 255).astype(np.uint8))
         
         logging.info(f"Saved rendered results to {results_dir}")
@@ -407,9 +494,9 @@ def main(cfg: SAM3DoConfig) -> None:
         logging.info(f"Sending to SAM3...")
         sam3_out = sam3_client.step(sam3_payload)
         
-        if not sam3_out:
-            logging.error("No output received from SAM3 server")
-            continue
+#        if not sam3_out:
+#            logging.error("No output received from SAM3 server")
+#            continue
         
         logging.info(f"Received output from SAM3: {sam3_out.keys()}")
         
@@ -433,13 +520,12 @@ def main(cfg: SAM3DoConfig) -> None:
         logging.info(f"Received output from SAM3Do: {sam3do_out.keys()}")
         
         # Check if mesh is in output and what it contains
-        if "mesh" in sam3do_out:
-            logging.info(f"Mesh type: {type(sam3do_out['mesh'])}")
-            if isinstance(sam3do_out['mesh'], list):
-                logging.info(f"Mesh list length: {len(sam3do_out['mesh'])}")
-                if len(sam3do_out['mesh']) > 0:
-                    logging.info(f"First mesh item type: {type(sam3do_out['mesh'][0])}")
-        
+        logging.info(f"Mesh type: {type(sam3do_out['mesh'])}")
+        if isinstance(sam3do_out['mesh'], list):
+            logging.info(f"Mesh list length: {len(sam3do_out['mesh'])}")
+            if len(sam3do_out['mesh']) > 0:
+                logging.info(f"First mesh item type: {type(sam3do_out['mesh'][0])}")
+    
         # Save results
         results_dir = Path(f"sam3do_results/result_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{frame_idx}")
         save_results(frame, sam3do_out, cfg, frame_idx, mask=mask)
