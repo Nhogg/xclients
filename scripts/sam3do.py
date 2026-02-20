@@ -6,7 +6,6 @@ import logging
 from typing import Dict, Union, Optional
 import time
 
-
 import json
 from datetime import datetime
 import numpy as np
@@ -19,6 +18,7 @@ from webpolicy.client import Client
 from xclients.renderer import Renderer
 from xclients.core.cfg import Config, spec
 from sam_utils.image_utils import load_image, get_frame
+from sam_utils.save_results import ResultSaver
 
 def spec(tree) -> dict:
     return jax.tree.map(lambda x: (x.shape, x.dtype), tree)
@@ -49,144 +49,6 @@ class SAM3DoConfig(Config):
     show: bool = False
     timeout: float = 60.0  # Timeout for server processing
     sam3: SAMConfig = field(default_factory=SAMConfig)
-
-def save_results(frame: np.ndarray, output: dict, cfg: SAM3DoConfig, frame_idx: int = 0, mask: np.ndarray = None):
-    """Save visualization and raw data from server output"""
-    
-    # Create output directory
-    output_dir = Path("sam3do_results")
-    output_dir.mkdir(exist_ok=True)
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    result_dir = output_dir / f"result_{timestamp}_{frame_idx}"
-    result_dir.mkdir(exist_ok=True)
-    
-    # Save the original image
-    cv2.imwrite(str(result_dir / "original.png"), frame)
-    
-    # Save SAM3 mask if available
-    original_shape = mask.shape
-    logging.info(f"Original mask shape: {original_shape}, dtype: {mask.dtype}")
-    
-        # Check for empty mask array first
-    if mask.size == 0 or (mask.ndim == 4 and mask.shape[0] == 0):
-        mask = None
-    else:
-        # Flatten mask if needed - keep flattening until we get (H, W)
-        while mask.ndim > 2:
-            if mask.shape[0] == 1:
-                mask = mask[0]  # Remove first dimension if it's 1
-            elif mask.shape[1] == 1:
-                mask = mask[:, 0]  # Remove second dimension if it's 1
-            else:
-                mask = mask[0]  # Default: take first element
-        
-        logging.info(f"Processed mask shape: {mask.shape}, dtype: {mask.dtype}, min: {np.min(mask)}, max: {np.max(mask)}")
-        
-        # Normalize mask to 0-255 if needed
-        if mask.dtype == np.float32 or mask.dtype == np.float64:
-            mask_vis = (mask * 255).astype(np.uint8)
-        elif mask.dtype == bool:
-            mask_vis = (mask.astype(np.uint8)) * 255
-        else:
-            mask_vis = mask.astype(np.uint8)
-        
-        cv2.imwrite(str(result_dir / "sam3_mask.png"), mask_vis)
-        
-        # Create masked image (mask multiplied by original)
-        if mask_vis.ndim == 2:
-            # Grayscale mask - expand to 3 channels
-            mask_3channel = np.stack([mask_vis] * 3, axis=-1)
-        else:
-            mask_3channel = mask_vis
-        
-        logging.info(f"Mask_3channel shape: {mask_3channel.shape}, frame shape: {frame.shape}")
-        
-        # Apply mask to original image
-        masked_image = (frame.astype(np.float32) * (mask_3channel.astype(np.float32) / 255.0)).astype(np.uint8)
-        cv2.imwrite(str(result_dir / "masked_image.png"), masked_image)
-        
-        logging.info("Saved SAM3 mask and masked image")
-
-    # Save pointmap visualization if available
-    p = output["pointmap"]
-        
-    # Handle different pointmap shapes
-    mu, std = p.mean(), p.std()
-    p = (p - mu) / (std + 1e-8)  # Normalize to zero mean and unit variance
-    p = (p+1) / 2  # Scale to [0, 1]
-    p = (p * 255).astype(np.uint8)
-    cv2.imwrite(str(result_dir / "pointmap.png"), cv2.cvtColor(p, cv2.COLOR_RGB2BGR))
-
-    # Save pointmap colors if available
-    pointmap_colors = output["pointmap_colors"]
-    logging.info(f"Pointmap colors shape: {pointmap_colors.shape}, dtype: {pointmap_colors.dtype}")
-    
-    if pointmap_colors.ndim == 3 and pointmap_colors.shape[2] == 3:
-        pointmap_colors_vis = (pointmap_colors * 255).astype(np.uint8)
-        pointmap_colors_bgr = cv2.cvtColor(pointmap_colors_vis, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(str(result_dir / "pointmap_colors.png"), pointmap_colors_bgr)
-
-    # Save overlay with 6D rotation visualization
-    overlay = frame.copy()
-    y_offset = 30
-    
-    rotation = output["rotation"]
-    logging.info(f"Rotation shape: {rotation.shape}, value: {rotation}")
-    cv2.putText(overlay, f"Rotation: {rotation.flatten()[:4]}", (10, y_offset),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    y_offset += 30
-    print(f"Rotation: {output['rotation']}")
-
-    rotation_6d = output["6drotation_normalized"]
-    logging.info(f"6D Rotation shape: {rotation_6d.shape}, value: {rotation_6d}")
-    cv2.putText(overlay, f"6D Rot: {rotation_6d.flatten()[:6]}", (10, y_offset),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    y_offset += 30
-    print(f"6D Rotation: {output['6drotation_normalized']}")
-
-    translation = output["translation"]
-    logging.info(f"Translation shape: {translation.shape}, value: {translation}")
-    cv2.putText(overlay, f"Trans: {translation.flatten()}", (10, y_offset),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    y_offset += 30
-    print(f"Translation: {output['translation']}")
-
-    scale = output["scale"]
-    logging.info(f"Scale shape: {scale.shape}, value: {scale}")
-    cv2.putText(overlay, f"Scale: {scale.flatten()}", (10, y_offset),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    print(f"Scale: {output['scale']}")
-
-    cv2.imwrite(str(result_dir / "overlay.png"), overlay)
-    
-    # Save raw data as JSON
-    data_to_save = {}
-    for key, value in output.items():
-        if isinstance(value, np.ndarray):
-            data_to_save[key] = {
-                "shape": list(value.shape),
-                "dtype": str(value.dtype),
-                "data": value.tolist() if value.size < 1000 else "too large to save"
-            }
-        elif key == "mesh" and isinstance(value, dict):
-            # Save mesh to separate NPZ file for easier loading
-            if "vertices" in value and "faces" in value:
-                mesh_path = result_dir / "mesh.npz"
-                np.savez(mesh_path, 
-                        vertices=value["vertices"],
-                        faces=value["faces"])
-                data_to_save[key] = f"saved to mesh.npz"
-            else:
-                data_to_save[key] = str(value)
-        else:
-            data_to_save[key] = str(value)
-    
-    with open(result_dir / "output.json", "w") as f:
-        json.dump(data_to_save, f, indent=2)
-    
-    logging.info(f"Saved results to {result_dir}")
-    return result_dir
 
 def render_sam3do_output(renderer, frame, sam3do_out, results_dir, frame_idx, cfg):
     """Render SAM3Do mesh output on frame"""
@@ -466,9 +328,9 @@ def main(cfg: SAM3DoConfig) -> None:
             if len(sam3do_out['mesh']) > 0:
                 logging.info(f"First mesh item type: {type(sam3do_out['mesh'][0])}")
     
-        # Save results
-        results_dir = Path(f"sam3do_results/result_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{frame_idx}")
-        save_results(frame, sam3do_out, cfg, frame_idx, mask=mask)
+        # Save result
+        saver = ResultSaver(base_dir=Path("sam3do_results"))
+        result_dir = saver.save_results(frame, sam3do_out, cfg, frame_idx, mask=mask)
         
         # Log the results
         for key, value in sam3do_out.items():
