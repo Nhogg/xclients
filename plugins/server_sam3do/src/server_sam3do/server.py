@@ -57,6 +57,7 @@ class PolicyConfig:
 class Config:
     port: int = 8003
     host: str = "0.0.0.0"
+    timeout: float | None = None
     policy: PolicyConfig = field(default_factory=PolicyConfig)
 
 
@@ -110,6 +111,36 @@ class Policy(BasePolicy):
     def reset(self, *args, **kwargs) -> None:
         pass
 
+    @staticmethod
+    def _to_numpy(value, dtype=None) -> np.ndarray:
+        if hasattr(value, "detach"):
+            value = value.detach()
+        if hasattr(value, "cpu"):
+            value = value.cpu()
+        array = np.asarray(value)
+        if dtype is not None:
+            array = array.astype(dtype, copy=False)
+        return array
+
+    def _serialize_mesh(self, mesh) -> dict[str, np.ndarray]:
+        if isinstance(mesh, dict) and "vertices" in mesh and "faces" in mesh:
+            vertices = self._to_numpy(mesh["vertices"], np.float32)
+            faces = self._to_numpy(mesh["faces"], np.int32)
+            return {"vertices": vertices, "faces": faces}
+
+        mesh_obj = None
+        if isinstance(mesh, (list, tuple)) and len(mesh) > 0:
+            mesh_obj = mesh[0]
+        elif hasattr(mesh, "vertices") and hasattr(mesh, "faces"):
+            mesh_obj = mesh
+
+        if mesh_obj is None or not hasattr(mesh_obj, "vertices") or not hasattr(mesh_obj, "faces"):
+            raise TypeError(f"Unsupported mesh format for serialization: {type(mesh)}")
+
+        vertices = self._to_numpy(mesh_obj.vertices, np.float32)
+        faces = self._to_numpy(mesh_obj.faces, np.int32)
+        return {"vertices": vertices, "faces": faces}
+
     def step(self, obs: dict) -> dict:
         """Process request with optional timeout"""
         # Extract timeout from payload, default to 30 seconds
@@ -144,8 +175,10 @@ class Policy(BasePolicy):
                 print(spec(result))
                 print(result["gs"].aabb)
 
-                for k in ["gaussian", "glb", "gs", "mesh", "coords", "coords_original", "shape"]:
+                for k in ["gaussian", "glb", "gs", "coords", "coords_original", "shape"]:
                     del result[k]
+                if "mesh" in result:
+                    result["mesh"] = self._serialize_mesh(result["mesh"])
                 # tensor to numpy . cpu no gpu. detach
                 return jax.tree.map(lambda x: x.cpu().numpy() if isinstance(x, torch.Tensor) else x, result)
 
@@ -177,8 +210,6 @@ class TryPolicy(BasePolicy):
             self.policy.reset(*args, **kwargs)
         except Exception as e:
             self.logger.error(f"Error during reset: {e}", exc_info=True)
-
-
 
 
 

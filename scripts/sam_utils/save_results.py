@@ -1,10 +1,10 @@
 """Result saving pipeline for SAM-based segmentation."""
-from __future import annotations
+from __future__ import annotations
 
 import json
 import logging
 from dataclasses import dataclass
-from dateime import datetime
+from datetime  import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 
 
-def eusure_dir(path: Path) -> Path:
+def ensure_dir(path: Path) -> Path:
     """Ensure that a directory exists."""
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -45,6 +45,21 @@ def squeeze_mask_to_hw(mask: np.ndarray) -> Optional[np.ndarray]:
         else:
             m = m[0]
     return m
+
+
+def apply_mask(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Apply a binary mask to an image, setting masked-out areas to black."""
+    if mask.shape != image.shape[:2]:
+        raise ValueError(f"Mask shape {mask.shape} does not match image shape {image.shape[:2]}")
+
+    masked = image.copy()
+    masked[mask == 0] = 0
+    return masked
+
+
+def mask_to_uint8_255(mask: np.ndarray) -> np.ndarray:
+    """Convert a binary mask to uint8 format with values 0 and 255."""
+    return (mask.astype(np.uint8) * 255)
 
 
 def normalize_pointmap_to_u8(pointmap: np.ndarray) -> np.ndarray:
@@ -203,7 +218,7 @@ class ResultSaver:
 
     def _save_output_json(self, output: dict[str, Any], result_dir: Path) -> None:
         """Save the output dict as a JSON file, converting non-serializable data."""
-        jsonable_output = to_jsonable_output(output, result_dir)
+        jsonable_output = to_jsonable_output(output, result_dir=result_dir)
         with open(result_dir / "output.json", "w") as f:
             json.dump(jsonable_output, f, indent=2)
 

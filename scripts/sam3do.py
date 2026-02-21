@@ -19,6 +19,7 @@ from xclients.renderer import Renderer
 from xclients.core.cfg import Config, spec
 from sam_utils.image_utils import load_image, get_frame
 from sam_utils.save_results import ResultSaver
+from sam3_utils.render_pipeline import Sam3DoRenderPipeline
 
 def spec(tree) -> dict:
     return jax.tree.map(lambda x: (x.shape, x.dtype), tree)
@@ -45,12 +46,12 @@ class SAM3DoConfig(Config):
     """Config for SAM3Do server"""
     input_source: Union[CameraInput, ImageInput] = tyro.MISSING
     host: str = "localhost"
-    port: int = 8001
+    port: int = 8003
     show: bool = False
     timeout: float = 60.0  # Timeout for server processing
     sam3: SAMConfig = field(default_factory=SAMConfig)
 
-def render_sam3do_output(renderer, frame, sam3do_out, results_dir, frame_idx, cfg):
+def _render_sam3do_output_legacy(renderer, frame, sam3do_out, results_dir, frame_idx, cfg):
     """Render SAM3Do mesh output on frame"""
     try:
         # Extract mesh data
@@ -260,6 +261,19 @@ def render_sam3do_output(renderer, frame, sam3do_out, results_dir, frame_idx, cf
         import traceback
         traceback.print_exc()
 
+
+RENDER_PIPELINE = Sam3DoRenderPipeline()
+
+
+def render_sam3do_output(renderer, frame, sam3do_out, result_dir, frame_idx, cfg):
+    RENDER_PIPELINE.render(
+        renderer=renderer,
+        frame=frame,
+        sam3do_out=sam3do_out,
+        result_dir=result_dir,
+        show=cfg.show,
+    )
+
 def main(cfg: SAM3DoConfig) -> None:
     """Create clients with extended timeout and run inference loop"""
     import cv2
@@ -320,17 +334,33 @@ def main(cfg: SAM3DoConfig) -> None:
             continue
         
         logging.info(f"Received output from SAM3Do: {sam3do_out.keys()}")
-        
+        if "error" in sam3do_out:
+            logging.error(f"SAM3Do server returned error: {sam3do_out['error']}")
+            continue
+
         # Check if mesh is in output and what it contains
-        logging.info(f"Mesh type: {type(sam3do_out['mesh'])}")
-        if isinstance(sam3do_out['mesh'], list):
-            logging.info(f"Mesh list length: {len(sam3do_out['mesh'])}")
-            if len(sam3do_out['mesh']) > 0:
-                logging.info(f"First mesh item type: {type(sam3do_out['mesh'][0])}")
+        mesh_data = sam3do_out.get("mesh")
+        if mesh_data is None:
+            logging.error(
+                "No mesh key in SAM3Do output; rendered_on_frame.png will not be produced. "
+                "SAM3Do keys: %s",
+                sorted(sam3do_out.keys()),
+            )
+        else:
+            logging.info(f"Mesh type: {type(mesh_data)}")
+            if isinstance(mesh_data, list):
+                logging.info(f"Mesh list length: {len(mesh_data)}")
+                if len(mesh_data) > 0:
+                    logging.info(f"First mesh item type: {type(mesh_data[0])}")
     
         # Save result
         saver = ResultSaver(base_dir=Path("sam3do_results"))
-        result_dir = saver.save_results(frame, sam3do_out, cfg, frame_idx, mask=mask)
+        result_dir = saver.save_results(frame, sam3do_out, cfg, frame_idx=frame_idx, mask=mask)
+        if mesh_data is None:
+            (result_dir / "render_error.txt").write_text(
+                "Missing 'mesh' in SAM3Do output. Restart server_sam3do to pick up latest code "
+                "and verify you are connected to the SAM3Do server port (default 8003), not SAM3."
+            )
         
         # Log the results
         for key, value in sam3do_out.items():
@@ -346,7 +376,7 @@ def main(cfg: SAM3DoConfig) -> None:
                 logging.info(f"  {key}: {type(value)}")
 
         # Render the output - FIX: pass renderer instance, not the class
-        render_sam3do_output(renderer, frame, sam3do_out, results_dir, frame_idx, cfg)
+        render_sam3do_output(renderer, frame, sam3do_out, result_dir, frame_idx, cfg)
         
         # Display if needed
         if cfg.show:
