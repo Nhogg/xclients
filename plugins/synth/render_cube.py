@@ -13,6 +13,8 @@ from pathlib import Path
 
 import tyro
 
+import robot_materials
+
 import isaacsim
 from isaacsim.simulation_app import SimulationApp
 
@@ -704,13 +706,20 @@ def apply_robot_randomization(scene: dict[str, object], rng: random.Random, view
     arm_angles["gripper_angle"] = grip_angle
 
     wall_color = rand_scene_color(rng)
-    if rng.random() < 0.5:
-        robot_color = rand_neutral_robot(rng)
+    if rng.random() < 0.55:
+        preset, diffuse, roughness, metallic = robot_materials.sample(rng)
+        scene["robot_material_preset"] = preset.name
     else:
-        robot_color = perturb_color(rng, wall_color)
-    robot_shader.GetInput("diffuseColor").Set(vec3(robot_color))
-    robot_shader.GetInput("roughness").Set(rng.uniform(0.12, 0.55))
-    robot_shader.GetInput("metallic").Set(rng.uniform(0.0, 0.85))
+        if rng.random() < 0.5:
+            diffuse = rand_neutral_robot(rng)
+        else:
+            diffuse = perturb_color(rng, wall_color)
+        roughness = rng.uniform(0.12, 0.55)
+        metallic = rng.uniform(0.0, 0.85)
+        scene["robot_material_preset"] = "random"
+    robot_shader.GetInput("diffuseColor").Set(vec3(diffuse))
+    robot_shader.GetInput("roughness").Set(roughness)
+    robot_shader.GetInput("metallic").Set(metallic)
 
     ground_shader.GetInput("diffuseColor").Set(vec3(rand_scene_color(rng, floor=True)))
     ground_shader.GetInput("roughness").Set(rng.uniform(0.2, 0.82))
@@ -1156,6 +1165,7 @@ def main(cfg: Config) -> None:
         if scene["mode"] == "asset":
             sidecar.update(robot_keypoint_payload(stage, subject_path, camera_path, scene))
             sidecar["visible_keypoint_count"] = int(scene.get("visible_keypoint_count", 0))
+            sidecar["robot_material_preset"] = scene.get("robot_material_preset")
         else:
             sidecar["joints"] = {}
             sidecar["keypoints"] = []

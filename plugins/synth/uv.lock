@@ -503,6 +503,21 @@ wheels = [
 ]
 
 [[package]]
+name = "drjit"
+version = "1.3.1"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cc/59/ad6676b8489bac52f414d95d3c1f04282b1c7f0b9605546bc1e93e0819d9/drjit-1.3.1-cp312-abi3-macosx_11_0_arm64.whl", hash = "sha256:15c80f88a9d61a243ef11a120435d1809c01fd30010367b00869a26c76ee6032", size = 3370045, upload-time = "2026-02-23T09:02:27.689Z" },
+    { url = "https://files.pythonhosted.org/packages/a1/55/df14df15a0985d1df614a2f8d0bc88b761f99513e5ae082ea17930297245/drjit-1.3.1-cp312-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:6664819fa67165d8241a9a83631e1f86a49192fa8d03890cce4830fdef8d85be", size = 4836430, upload-time = "2026-02-23T09:02:29.311Z" },
+    { url = "https://files.pythonhosted.org/packages/83/f2/66137ea23e4b592b366edb3db30e065f2bb5b680e2276b1d2ec581049d5f/drjit-1.3.1-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f3fe4207ac5382e15e66ae4a22557e5087f6ff09cf09d3b8eda682e08cbb85fc", size = 4533222, upload-time = "2026-02-23T09:02:30.479Z" },
+    { url = "https://files.pythonhosted.org/packages/dd/20/f71d81a7e33925a9e63e2d612b10b0b77edbc7cb0dfa4b823645c7aa96db/drjit-1.3.1-cp312-abi3-win_amd64.whl", hash = "sha256:d667ae91a390ecb04a69071a18641b2b5e583cbcab1b67a03ff69565bf7a89f5", size = 4099930, upload-time = "2026-02-23T09:02:31.803Z" },
+    { url = "https://files.pythonhosted.org/packages/b1/c6/5db4c4bfa35d4e88278990164fa55096242b5b95a5e813f975d2c4d94482/drjit-1.3.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:8533ba00f2b1c116475631c7a74072436eaa9504833e3d35ebe18cbf73f83b05", size = 3344444, upload-time = "2026-02-23T09:02:33.032Z" },
+    { url = "https://files.pythonhosted.org/packages/0a/b4/9c605027284392b201243089ab39829602d6e6a5ad24421eddebe897bfa5/drjit-1.3.1-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:14bcd7759dc67d7c2b9fb407af635c65f0aa4d1ea16819366c9e26bf46a236d4", size = 4835272, upload-time = "2026-02-23T09:02:35.034Z" },
+    { url = "https://files.pythonhosted.org/packages/2a/86/fd461d1106176adbd72b37809c219226b27e38e7d0d0fa683a5399d71502/drjit-1.3.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7382972c0fa46f335db887dbecd583f7b6bfa67f4b9a8e8dc3681ad033724057", size = 4519842, upload-time = "2026-02-23T09:02:37.319Z" },
+    { url = "https://files.pythonhosted.org/packages/f1/60/4f9a5901bc18e88ea314d6365294a008db963656f1fd144bf13b9596dd86/drjit-1.3.1-cp312-cp312-win_amd64.whl", hash = "sha256:6d95f6be04e6bbd3f2c4986ba4966129ea828640652b2b168ad8748cede90591", size = 4096337, upload-time = "2026-02-23T09:02:38.781Z" },
+]
+
+[[package]]
 name = "embreex"
 version = "4.4.0rc0"
 source = { registry = "https://pypi.org/simple" }
@@ -1296,6 +1311,24 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d6/54/cfe61301667036ec958cb99bd3efefba235e65cdeb9c84d24a8293ba1d90/mdurl-0.1.2.tar.gz", hash = "sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba", size = 8729, upload-time = "2022-08-14T12:40:10.846Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b3/38/89ba8ad64ae25be8de66a6d463314cf1eb366222074cfda9ee839c56a4b4/mdurl-0.1.2-py3-none-any.whl", hash = "sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8", size = 9979, upload-time = "2022-08-14T12:40:09.779Z" },
+]
+
+[[package]]
+name = "mitsuba"
+version = "3.8.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "drjit" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e7/85/90fefee087141a3ef50c725dee9b0479d07dfc352a8476388c05b5226957/mitsuba-3.8.0-cp312-abi3-macosx_11_0_arm64.whl", hash = "sha256:c1f3f3ed87925f97572e99b762c7bd999ac2227ad7493b5f88567a97468f2a23", size = 37574705, upload-time = "2026-02-23T16:06:50.18Z" },
+    { url = "https://files.pythonhosted.org/packages/77/26/609dcb0998b994f05102a2b6c41634092cf00c475b7286c4e3c8593e9e46/mitsuba-3.8.0-cp312-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:9c826a7d934d73b59db17591c390de69ddfa1c91473541794a6a433cbb710fe6", size = 53989259, upload-time = "2026-02-23T16:06:53.57Z" },
+    { url = "https://files.pythonhosted.org/packages/b6/b4/4cfc7ea1305461acc6145852c1073da8422f64da229be3e5fe1ea52931a5/mitsuba-3.8.0-cp312-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:991cd863bb47afc5b885117bb2d90750d75f46dbea41007e47bb24cd8767de0e", size = 63046965, upload-time = "2026-02-23T16:06:57.05Z" },
+    { url = "https://files.pythonhosted.org/packages/52/d8/3a69c5d061d0e7f749356fe9298d1cb6c91a085ee4dece600f817ca7b18c/mitsuba-3.8.0-cp312-abi3-win_amd64.whl", hash = "sha256:f30621af86bd6d99374940f16c193d812855cc54d774dd43220c02ac6628d04b", size = 46450881, upload-time = "2026-02-23T16:07:00.304Z" },
+    { url = "https://files.pythonhosted.org/packages/1b/f0/0198ac7d1dc8769a4b6a8d6bcee1cfa598bee2c77cd8da412ed73b763ca4/mitsuba-3.8.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:c3b15649b81d85d9796ad27a25b4beaf4139a776e0c02cdb6a1461a62b887416", size = 37500823, upload-time = "2026-02-23T16:07:03.019Z" },
+    { url = "https://files.pythonhosted.org/packages/4f/61/af29ff70fa07c53eac67ca731e8a67d1cf3a7d735837280a5fd24994e04e/mitsuba-3.8.0-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:212f5a19df757dad12a782aeaa0a4764f9be375091c2badb0734ffbe3c1507b6", size = 53949828, upload-time = "2026-02-23T16:07:05.605Z" },
+    { url = "https://files.pythonhosted.org/packages/d2/bb/ddd5260b29db01941aa3d6ac82e391445ba69b237381e10a9f5eb444f959/mitsuba-3.8.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:ab3f290bba4576cd0951a9bb71a9907d12a6b74a9ae8df2af2ad7ee48f781a2b", size = 62977153, upload-time = "2026-02-23T16:07:14.258Z" },
+    { url = "https://files.pythonhosted.org/packages/a7/8b/aa6db9f8572dbf2f17575399d7ac9c50a053b9c77d94ee6955289aa6331b/mitsuba-3.8.0-cp312-cp312-win_amd64.whl", hash = "sha256:aa5d2a3212868aec0f0d4f40c962c8c88e576ac3d2297cff1b729e3d2b91c475", size = 46457053, upload-time = "2026-02-23T16:07:17.661Z" },
 ]
 
 [[package]]
@@ -2402,10 +2435,13 @@ dependencies = [
     { name = "isaacsim" },
     { name = "isaacsim-replicator" },
     { name = "isaacsim-robot" },
+    { name = "mitsuba" },
     { name = "opencv-python-headless" },
     { name = "pyroki" },
+    { name = "trimesh" },
     { name = "tyro" },
     { name = "urdf-usd-converter" },
+    { name = "yourdfpy" },
 ]
 
 [package.metadata]
@@ -2413,10 +2449,13 @@ requires-dist = [
     { name = "isaacsim", specifier = "==6.0.0.0" },
     { name = "isaacsim-replicator", specifier = "==6.0.0.0" },
     { name = "isaacsim-robot", specifier = "==6.0.0.0" },
+    { name = "mitsuba", specifier = ">=3.8.0" },
     { name = "opencv-python-headless", specifier = ">=4.13.0.90" },
     { name = "pyroki", git = "https://github.com/chungmin99/pyroki" },
+    { name = "trimesh", specifier = ">=4.11.1" },
     { name = "tyro", specifier = ">=0.9.17" },
     { name = "urdf-usd-converter", git = "https://github.com/newton-physics/urdf-usd-converter?tag=v0.1.0" },
+    { name = "yourdfpy", specifier = ">=0.0.60" },
 ]
 
 [[package]]

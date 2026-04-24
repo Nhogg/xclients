@@ -8,10 +8,13 @@ dependencies = [
     "isaacsim==6.0.0.0",
     "isaacsim-replicator==6.0.0.0",
     "isaacsim-robot==6.0.0.0",
+    "mitsuba>=3.8.0",
     "opencv-python-headless>=4.13.0.90",
     "pyroki",
+    "trimesh>=4.11.1",
     "tyro>=0.9.17",
     "urdf-usd-converter==0.1.0",
+    "yourdfpy>=0.0.60",
 ]
 
 [tool.uv]
