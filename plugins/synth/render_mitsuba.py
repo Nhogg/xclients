@@ -13,11 +13,15 @@ import numpy as np
 import tyro
 import trimesh
 import yourdfpy
+from PIL import Image, ImageDraw
 
 os.environ.setdefault("DRJIT_NO_LLVM_WARNING", "1")
 import mitsuba as mi
 
 mi.set_variant("cuda_ad_rgb")
+
+from background import CocoBackgroundSampler, composite as composite_bg
+from mask_renderer import MaskRenderer, Intrinsics as MaskIntrinsics
 
 
 HERE = Path(__file__).resolve().parent
@@ -625,6 +629,36 @@ def intrinsics_from_focal(focal_length: float, width: int, height: int) -> dict:
     return {"fx": fx, "fy": fy, "cx": cx, "cy": cy, "width": width, "height": height}
 
 
+def mitsuba_cam_to_usd(cam_to_world_mi: np.ndarray) -> np.ndarray:
+    """Convert Mitsuba cam-to-world (right=+X, up=+Y, forward=+Z) to USD-style
+    cam-to-world (image-right=+X, up=+Y, forward=-Z) used by mask_renderer.
+
+    Negate columns 0 and 2: flips the X axis (Mitsuba's X is image-left) and
+    the Z axis (Mitsuba's Z is forward, USD's Z is backward).
+    """
+    M = cam_to_world_mi.copy()
+    M[:, 0] = -M[:, 0]
+    M[:, 2] = -M[:, 2]
+    return M
+
+
+_INST_COLORS = np.array(
+    [
+        [0, 0, 0],
+        [220, 60, 60], [60, 200, 60], [60, 100, 220], [230, 200, 40],
+        [200, 60, 200], [60, 200, 220], [240, 140, 40], [140, 80, 220],
+        [180, 60, 80], [80, 220, 140], [180, 220, 80], [220, 80, 160],
+        [60, 140, 80], [220, 160, 100], [120, 160, 220], [160, 220, 220],
+    ],
+    dtype=np.uint8,
+)
+
+
+def colorize_instance(inst: np.ndarray) -> np.ndarray:
+    n = _INST_COLORS.shape[0]
+    return _INST_COLORS[np.clip(inst, 0, n - 1)]
+
+
 def render_view(
     urdf: yourdfpy.URDF,
     mesh_cache: dict[str, Path],
@@ -632,6 +666,8 @@ def render_view(
     view_index: int,
     cfg,
     out_dir: Path,
+    bg_sampler: CocoBackgroundSampler | None = None,
+    mask_renderer: MaskRenderer | None = None,
 ):
     reject = {"room": 0, "self": 0, "camera": 0, "pose": 0, "dark": 0}
     image_path = out_dir / f"view_{view_index}.png"
@@ -697,19 +733,43 @@ def render_view(
             denoiser = mi.OptixDenoiser(input_size=[cfg.image_width, cfg.image_height])
             img = denoiser(img)
         bmp = mi.Bitmap(img).convert(mi.Bitmap.PixelFormat.RGB, mi.Struct.Type.UInt8, srgb_gamma=True)
-        bmp.write(str(image_path))
-
-        arr = np.asarray(bmp)
-        mean = float(arr.mean())
+        rgb_arr = np.asarray(bmp).copy()
+        mean = float(rgb_arr.mean())
         if mean < 8.0:
             reject["dark"] += 1
             continue
 
+        if mask_renderer is not None and bg_sampler is not None:
+            mask_intr = MaskIntrinsics(
+                fx=intr["fx"], fy=intr["fy"], cx=intr["cx"], cy=intr["cy"],
+                width=cfg.image_width, height=cfg.image_height,
+            )
+            usd_cam_to_world = mitsuba_cam_to_usd(meta["cam_to_world"])
+            world_to_cam_row = np.linalg.inv(usd_cam_to_world).T
+            mask_joints = {k: float(v) for k, v in joint_cfg.items()}
+            binary, instance = mask_renderer.render(mask_joints, world_to_cam_row, mask_intr)
+            bg, bg_name = bg_sampler.sample(cfg.image_width, cfg.image_height)
+            comp = composite_bg(rgb_arr, binary, bg, erode_px=1)
+            sidecar_bg = bg_name
+            Image.fromarray(comp).save(image_path)
+            Image.fromarray(binary).save(out_dir / f"view_{view_index}_mask.png")
+            Image.fromarray(colorize_instance(instance)).save(out_dir / f"view_{view_index}_inst.png")
+            kp_img = Image.fromarray(comp).convert("RGB")
+        else:
+            sidecar_bg = None
+            bmp.write(str(image_path))
+            kp_img = Image.open(image_path).convert("RGB")
+
         # Sidecar
         keypoints = []
+        kp_draw = ImageDraw.Draw(kp_img)
         for name, pt in points:
             proj = project_point(world_to_cam, pt, intr["fx"], intr["fy"], intr["cx"], intr["cy"], cfg.image_width, cfg.image_height)
             keypoints.append({"name": name, "world_xyz": [float(pt[0]), float(pt[1]), float(pt[2])], **proj})
+            if proj["pixel_xy"] and proj["visible"]:
+                x, y = proj["pixel_xy"]
+                kp_draw.ellipse([x - 3, y - 3, x + 3, y + 3], outline="red", width=2)
+        kp_img.save(out_dir / f"view_{view_index}_kp.png")
 
         sidecar = {
             "image_file": image_path.name,
@@ -719,6 +779,7 @@ def render_view(
             "camera_focal_length": float(focal_length),
             "reject_counts": reject,
             "visible_keypoint_count": visible,
+            "background": sidecar_bg,
             "joints": {
                 **{f"joint{i+1}": angles_deg[i] for i in range(7)},
                 "gripper_angle": grip_angle,
@@ -754,12 +815,14 @@ class Config:
     num_views: int = 50
     output_dir: Path = Path("renders/mitsuba_views")
     no_clean: bool = False
-    image_width: int = 512
-    image_height: int = 512
+    image_width: int = 640
+    image_height: int = 480
     fx_min: float = 450.0
     fx_max: float = 900.0
     spp: int = 64
     denoise: bool = True  # apply OptiX denoiser post-render
+    coco_dir: Path = Path("~/bafl/coco/train2014").expanduser()  # COCO bg images
+    composite: bool = True  # composite robot over a random COCO image
 
 
 def main(cfg: Config) -> None:
@@ -773,10 +836,18 @@ def main(cfg: Config) -> None:
     print(f"Prepared {len(mesh_cache)} PLY meshes in {PLY_CACHE}")
 
     urdf = yourdfpy.URDF.load(str(URDF_PATH), load_meshes=False, build_scene_graph=True)
+
+    bg_sampler: CocoBackgroundSampler | None = None
+    mask_renderer: MaskRenderer | None = None
+    if cfg.composite:
+        bg_sampler = CocoBackgroundSampler(cfg.coco_dir, rng=random.Random(cfg.seed + 1))
+        mask_renderer = MaskRenderer(URDF_PATH, include_gripper=True)
+        print(f"Compositing over {len(bg_sampler)} COCO images from {cfg.coco_dir}")
+
     rng = random.Random(cfg.seed)
     totals = {"room": 0, "self": 0, "camera": 0, "pose": 0, "dark": 0}
     for i in range(cfg.num_views):
-        r = render_view(urdf, mesh_cache, rng, i, cfg, out)
+        r = render_view(urdf, mesh_cache, rng, i, cfg, out, bg_sampler, mask_renderer)
         for k, v in r.items():
             totals[k] += v
     print(f"Wrote renders to {out}")
