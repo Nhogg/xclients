@@ -1,28 +1,29 @@
 from __future__ import annotations
 
 import colorsys
+from dataclasses import dataclass
 import json
 import math
 import os
+from pathlib import Path
 import random
 import shutil
-from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
-import tyro
-import trimesh
-import yourdfpy
 from PIL import Image, ImageDraw
+import trimesh
+import tyro
+import yourdfpy
 
 os.environ.setdefault("DRJIT_NO_LLVM_WARNING", "1")
 import mitsuba as mi
 
 mi.set_variant("cuda_ad_rgb")
 
-from background import CocoBackgroundSampler, composite as composite_bg
-from mask_renderer import MaskRenderer, Intrinsics as MaskIntrinsics
-
+from background import CocoBackgroundSampler
+from background import composite as composite_bg
+from mask_renderer import Intrinsics as MaskIntrinsics
+from mask_renderer import MaskRenderer
 
 HERE = Path(__file__).resolve().parent
 URDF_PATH = HERE / "xarm7_standalone.urdf"
@@ -49,6 +50,7 @@ ARM_TIGHT_LIMITS_DEG = [
 ]
 ARM_FULL_LIMITS_DEG = [170.0, 110.0, 165.0, 120.0, 165.0, 110.0, 175.0]
 
+
 def robot_visual_links(urdf: yourdfpy.URDF) -> list[str]:
     names: list[str] = []
     for link in urdf.robot.links:
@@ -57,6 +59,7 @@ def robot_visual_links(urdf: yourdfpy.URDF) -> list[str]:
                 names.append(link.name)
                 break
     return names
+
 
 KEYPOINT_JOINTS = [
     ("base", None, "link_base"),
@@ -323,9 +326,7 @@ def robot_bbox(urdf: yourdfpy.URDF, mesh_cache: dict[str, Path]) -> tuple[np.nda
             continue
         m = trimesh.load(mesh_cache[stem], force="mesh")
         pts = np.asarray(m.bounds)  # (2,3) in mesh local frame
-        corners = np.array(
-            [[x, y, z] for x in pts[:, 0] for y in pts[:, 1] for z in pts[:, 2]]
-        )
+        corners = np.array([[x, y, z] for x in pts[:, 0] for y in pts[:, 1] for z in pts[:, 2]])
         corners_h = np.hstack([corners, np.ones((8, 1))])
         world = (link_xf @ corners_h.T).T[:, :3]
         mn = np.minimum(mn, world.min(axis=0))
@@ -530,7 +531,11 @@ def build_scene_dict(
             "type": "constant",
             "radiance": {
                 "type": "rgb",
-                "value": [dome_color[0] * dome_intensity, dome_color[1] * dome_intensity, dome_color[2] * dome_intensity],
+                "value": [
+                    dome_color[0] * dome_intensity,
+                    dome_color[1] * dome_intensity,
+                    dome_color[2] * dome_intensity,
+                ],
             },
         }
 
@@ -554,7 +559,11 @@ def build_scene_dict(
             "direction": dir_from_rpy(fill_rot),
             "irradiance": {
                 "type": "rgb",
-                "value": [fill_color[0] * fill_intensity, fill_color[1] * fill_intensity, fill_color[2] * fill_intensity],
+                "value": [
+                    fill_color[0] * fill_intensity,
+                    fill_color[1] * fill_intensity,
+                    fill_color[2] * fill_intensity,
+                ],
             },
         }
 
@@ -578,10 +587,38 @@ def build_scene_dict(
     # Open-top room so dome/directional lights can enter.
     walls = [
         ("ground", (0.0, 0.0, ROOM_Z_MIN), ROOM_X, ROOM_Y_POS, (0, 0, 1), ground_bsdf),
-        ("backdrop", (0.0, ROOM_Y_NEG, (ROOM_Z_MIN + ROOM_Z_MAX) / 2), ROOM_X, (ROOM_Z_MAX - ROOM_Z_MIN) / 2, (0, 1, 0), backdrop_bsdf),
-        ("left_wall", (-ROOM_X, 0.0, (ROOM_Z_MIN + ROOM_Z_MAX) / 2), ROOM_Y_POS, (ROOM_Z_MAX - ROOM_Z_MIN) / 2, (1, 0, 0), wall_bsdf),
-        ("right_wall", (ROOM_X, 0.0, (ROOM_Z_MIN + ROOM_Z_MAX) / 2), ROOM_Y_POS, (ROOM_Z_MAX - ROOM_Z_MIN) / 2, (-1, 0, 0), wall_bsdf),
-        ("front_wall", (0.0, ROOM_Y_POS, (ROOM_Z_MIN + ROOM_Z_MAX) / 2), ROOM_X, (ROOM_Z_MAX - ROOM_Z_MIN) / 2, (0, -1, 0), wall_bsdf),
+        (
+            "backdrop",
+            (0.0, ROOM_Y_NEG, (ROOM_Z_MIN + ROOM_Z_MAX) / 2),
+            ROOM_X,
+            (ROOM_Z_MAX - ROOM_Z_MIN) / 2,
+            (0, 1, 0),
+            backdrop_bsdf,
+        ),
+        (
+            "left_wall",
+            (-ROOM_X, 0.0, (ROOM_Z_MIN + ROOM_Z_MAX) / 2),
+            ROOM_Y_POS,
+            (ROOM_Z_MAX - ROOM_Z_MIN) / 2,
+            (1, 0, 0),
+            wall_bsdf,
+        ),
+        (
+            "right_wall",
+            (ROOM_X, 0.0, (ROOM_Z_MIN + ROOM_Z_MAX) / 2),
+            ROOM_Y_POS,
+            (ROOM_Z_MAX - ROOM_Z_MIN) / 2,
+            (-1, 0, 0),
+            wall_bsdf,
+        ),
+        (
+            "front_wall",
+            (0.0, ROOM_Y_POS, (ROOM_Z_MIN + ROOM_Z_MAX) / 2),
+            ROOM_X,
+            (ROOM_Z_MAX - ROOM_Z_MIN) / 2,
+            (0, -1, 0),
+            wall_bsdf,
+        ),
     ]
     for name, center, eu, ev, normal, bsdf in walls:
         scene[name] = {
@@ -645,10 +682,22 @@ def mitsuba_cam_to_usd(cam_to_world_mi: np.ndarray) -> np.ndarray:
 _INST_COLORS = np.array(
     [
         [0, 0, 0],
-        [220, 60, 60], [60, 200, 60], [60, 100, 220], [230, 200, 40],
-        [200, 60, 200], [60, 200, 220], [240, 140, 40], [140, 80, 220],
-        [180, 60, 80], [80, 220, 140], [180, 220, 80], [220, 80, 160],
-        [60, 140, 80], [220, 160, 100], [120, 160, 220], [160, 220, 220],
+        [220, 60, 60],
+        [60, 200, 60],
+        [60, 100, 220],
+        [230, 200, 40],
+        [200, 60, 200],
+        [60, 200, 220],
+        [240, 140, 40],
+        [140, 80, 220],
+        [180, 60, 80],
+        [80, 220, 140],
+        [180, 220, 80],
+        [220, 80, 160],
+        [60, 140, 80],
+        [220, 160, 100],
+        [120, 160, 220],
+        [160, 220, 220],
     ],
     dtype=np.uint8,
 )
@@ -679,20 +728,21 @@ def render_view(
         grip_angle = rng.uniform(0.0, 28.0)
 
         joint_cfg = {
-            k: np.float64(v) for k, v in {
-            "joint1": math.radians(angles_deg[0]),
-            "joint2": math.radians(angles_deg[1]),
-            "joint3": math.radians(angles_deg[2]),
-            "joint4": math.radians(angles_deg[3]),
-            "joint5": math.radians(angles_deg[4]),
-            "joint6": math.radians(angles_deg[5]),
-            "joint7": math.radians(angles_deg[6]),
-            "drive_joint": math.radians(grip_angle),
-            "left_finger_joint": math.radians(-grip_angle),
-            "left_inner_knuckle_joint": math.radians(grip_angle),
-            "right_outer_knuckle_joint": math.radians(-grip_angle),
-            "right_finger_joint": math.radians(grip_angle),
-            "right_inner_knuckle_joint": math.radians(-grip_angle),
+            k: np.float64(v)
+            for k, v in {
+                "joint1": math.radians(angles_deg[0]),
+                "joint2": math.radians(angles_deg[1]),
+                "joint3": math.radians(angles_deg[2]),
+                "joint4": math.radians(angles_deg[3]),
+                "joint5": math.radians(angles_deg[4]),
+                "joint6": math.radians(angles_deg[5]),
+                "joint7": math.radians(angles_deg[6]),
+                "drive_joint": math.radians(grip_angle),
+                "left_finger_joint": math.radians(-grip_angle),
+                "left_inner_knuckle_joint": math.radians(grip_angle),
+                "right_outer_knuckle_joint": math.radians(-grip_angle),
+                "right_finger_joint": math.radians(grip_angle),
+                "right_inner_knuckle_joint": math.radians(-grip_angle),
             }.items()
         }
         urdf.update_cfg(joint_cfg)
@@ -707,8 +757,14 @@ def render_view(
             continue
 
         scene_dict, meta, (eye, target, rpy_deg) = build_scene_dict(
-            urdf, mesh_cache, rng, view_index, cfg.num_views,
-            cfg.image_width, cfg.image_height, focal_length,
+            urdf,
+            mesh_cache,
+            rng,
+            view_index,
+            cfg.num_views,
+            cfg.image_width,
+            cfg.image_height,
+            focal_length,
         )
 
         if camera_collides(eye, meta["robot_bbox_mn"], meta["robot_bbox_mx"], points):
@@ -720,7 +776,9 @@ def render_view(
         world_to_cam = np.linalg.inv(meta["cam_to_world"])
         visible = 0
         for _, p in points:
-            proj = project_point(world_to_cam, p, intr["fx"], intr["fy"], intr["cx"], intr["cy"], cfg.image_width, cfg.image_height)
+            proj = project_point(
+                world_to_cam, p, intr["fx"], intr["fy"], intr["cx"], intr["cy"], cfg.image_width, cfg.image_height
+            )
             if proj["visible"]:
                 visible += 1
         if visible < 1:
@@ -741,8 +799,12 @@ def render_view(
 
         if mask_renderer is not None and bg_sampler is not None:
             mask_intr = MaskIntrinsics(
-                fx=intr["fx"], fy=intr["fy"], cx=intr["cx"], cy=intr["cy"],
-                width=cfg.image_width, height=cfg.image_height,
+                fx=intr["fx"],
+                fy=intr["fy"],
+                cx=intr["cx"],
+                cy=intr["cy"],
+                width=cfg.image_width,
+                height=cfg.image_height,
             )
             usd_cam_to_world = mitsuba_cam_to_usd(meta["cam_to_world"])
             world_to_cam_row = np.linalg.inv(usd_cam_to_world).T
@@ -762,13 +824,33 @@ def render_view(
 
         # Sidecar
         keypoints = []
+        pixel_by_name: dict[str, tuple[float, float]] = {}
         kp_draw = ImageDraw.Draw(kp_img)
         for name, pt in points:
-            proj = project_point(world_to_cam, pt, intr["fx"], intr["fy"], intr["cx"], intr["cy"], cfg.image_width, cfg.image_height)
+            proj = project_point(
+                world_to_cam, pt, intr["fx"], intr["fy"], intr["cx"], intr["cy"], cfg.image_width, cfg.image_height
+            )
             keypoints.append({"name": name, "world_xyz": [float(pt[0]), float(pt[1]), float(pt[2])], **proj})
-            if proj["pixel_xy"] and proj["visible"]:
-                x, y = proj["pixel_xy"]
-                kp_draw.ellipse([x - 3, y - 3, x + 3, y + 3], outline="red", width=2)
+            if proj["pixel_xy"]:
+                pixel_by_name[name] = tuple(proj["pixel_xy"])
+        skeleton_edges = [
+            ("base", "joint1"),
+            ("joint1", "joint2"),
+            ("joint2", "joint3"),
+            ("joint3", "joint4"),
+            ("joint4", "joint5"),
+            ("joint5", "joint6"),
+            ("joint6", "joint7"),
+            ("joint7", "eef"),
+            ("eef", "tcp"),
+        ]
+        for a, b in skeleton_edges:
+            if a in pixel_by_name and b in pixel_by_name:
+                kp_draw.line([pixel_by_name[a], pixel_by_name[b]], fill="yellow", width=2)
+        for kp in keypoints:
+            if kp["pixel_xy"] and kp["visible"]:
+                x, y = kp["pixel_xy"]
+                kp_draw.ellipse([x - 3, y - 3, x + 3, y + 3], fill="red", outline="white", width=1)
         kp_img.save(out_dir / f"view_{view_index}_kp.png")
 
         sidecar = {
@@ -781,7 +863,7 @@ def render_view(
             "visible_keypoint_count": visible,
             "background": sidecar_bg,
             "joints": {
-                **{f"joint{i+1}": angles_deg[i] for i in range(7)},
+                **{f"joint{i + 1}": angles_deg[i] for i in range(7)},
                 "gripper_angle": grip_angle,
                 "sample_mode": sample_mode,
             },
@@ -799,8 +881,8 @@ def render_view(
         }
         json_path.write_text(json.dumps(sidecar, indent=2))
         print(
-            f"view_{view_index}: eye={tuple(round(v,2) for v in eye)} "
-            f"target={tuple(round(v,2) for v in target)} mean={mean:.1f} "
+            f"view_{view_index}: eye={tuple(round(v, 2) for v in eye)} "
+            f"target={tuple(round(v, 2) for v in target)} mean={mean:.1f} "
             f"rejects={reject} visible={visible}"
         )
         return reject
@@ -818,8 +900,8 @@ class Config:
     image_width: int = 640
     image_height: int = 480
     fx_min: float = 450.0
-    fx_max: float = 900.0
-    spp: int = 64
+    fx_max: float = 550.0
+    spp: int = 4000
     denoise: bool = True  # apply OptiX denoiser post-render
     coco_dir: Path = Path("~/bafl/coco/train2014").expanduser()  # COCO bg images
     composite: bool = True  # composite robot over a random COCO image
