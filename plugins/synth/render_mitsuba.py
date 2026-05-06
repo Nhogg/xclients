@@ -797,25 +797,28 @@ def render_view(
             reject["dark"] += 1
             continue
 
-        if mask_renderer is not None and bg_sampler is not None:
-            mask_intr = MaskIntrinsics(
-                fx=intr["fx"],
-                fy=intr["fy"],
-                cx=intr["cx"],
-                cy=intr["cy"],
-                width=cfg.image_width,
-                height=cfg.image_height,
-            )
-            usd_cam_to_world = mitsuba_cam_to_usd(meta["cam_to_world"])
-            world_to_cam_row = np.linalg.inv(usd_cam_to_world).T
-            mask_joints = {k: float(v) for k, v in joint_cfg.items()}
-            binary, instance = mask_renderer.render(mask_joints, world_to_cam_row, mask_intr)
+        # Always render & save the mask. Train-time COCO augmentation reads it
+        # from the arec record; bypassing this branch would silently strip it.
+        mask_intr = MaskIntrinsics(
+            fx=intr["fx"],
+            fy=intr["fy"],
+            cx=intr["cx"],
+            cy=intr["cy"],
+            width=cfg.image_width,
+            height=cfg.image_height,
+        )
+        usd_cam_to_world = mitsuba_cam_to_usd(meta["cam_to_world"])
+        world_to_cam_row = np.linalg.inv(usd_cam_to_world).T
+        mask_joints = {k: float(v) for k, v in joint_cfg.items()}
+        binary, instance = mask_renderer.render(mask_joints, world_to_cam_row, mask_intr)
+        Image.fromarray(binary).save(out_dir / f"view_{view_index}_mask.png")
+        Image.fromarray(colorize_instance(instance)).save(out_dir / f"view_{view_index}_inst.png")
+
+        if bg_sampler is not None:
             bg, bg_name = bg_sampler.sample(cfg.image_width, cfg.image_height)
             comp = composite_bg(rgb_arr, binary, bg, erode_px=1)
             sidecar_bg = bg_name
             Image.fromarray(comp).save(image_path)
-            Image.fromarray(binary).save(out_dir / f"view_{view_index}_mask.png")
-            Image.fromarray(colorize_instance(instance)).save(out_dir / f"view_{view_index}_inst.png")
             kp_img = Image.fromarray(comp).convert("RGB")
         else:
             sidecar_bg = None
@@ -895,8 +898,18 @@ class Config:
 
     seed: int = 20260413
     num_views: int = 50
+    # Index of the first view this run writes (loop iterates
+    # `range(start_index, start_index + num_views)`). Used to split a single
+    # output directory across multiple machines without filename collisions —
+    # e.g. machine A: --start-index 0 --num-views 50000;
+    #      machine B: --start-index 50000 --num-views 50000 (with a different
+    #      --seed so poses don't duplicate).
+    start_index: int = 0
     output_dir: Path = Path("renders/mitsuba_views")
-    no_clean: bool = False
+    # Default ON to make multi-machine writes safe — wiping the shared dir
+    # from one process would clobber the other's output. Pass --clean to
+    # explicitly request the wipe (e.g. for single-machine reruns).
+    no_clean: bool = True
     image_width: int = 640
     image_height: int = 480
     fx_min: float = 450.0
@@ -912,23 +925,28 @@ def main(cfg: Config) -> None:
     if out.exists() and not cfg.no_clean:
         shutil.rmtree(out)
     out.mkdir(parents=True, exist_ok=True)
-    print(f"Writing to {out} (seed={cfg.seed}, num_views={cfg.num_views}, spp={cfg.spp})")
+    print(
+        f"Writing to {out} (seed={cfg.seed}, "
+        f"views={cfg.start_index}..{cfg.start_index + cfg.num_views - 1}, "
+        f"spp={cfg.spp})"
+    )
 
     mesh_cache = ensure_ply_cache()
     print(f"Prepared {len(mesh_cache)} PLY meshes in {PLY_CACHE}")
 
     urdf = yourdfpy.URDF.load(str(URDF_PATH), load_meshes=False, build_scene_graph=True)
 
+    # Mask is always rendered (downstream training uses it for runtime COCO aug).
+    # Compositing is the optional step that bakes a COCO background into the RGB.
+    mask_renderer = MaskRenderer(URDF_PATH, include_gripper=True)
     bg_sampler: CocoBackgroundSampler | None = None
-    mask_renderer: MaskRenderer | None = None
     if cfg.composite:
         bg_sampler = CocoBackgroundSampler(cfg.coco_dir, rng=random.Random(cfg.seed + 1))
-        mask_renderer = MaskRenderer(URDF_PATH, include_gripper=True)
         print(f"Compositing over {len(bg_sampler)} COCO images from {cfg.coco_dir}")
 
     rng = random.Random(cfg.seed)
     totals = {"room": 0, "self": 0, "camera": 0, "pose": 0, "dark": 0}
-    for i in range(cfg.num_views):
+    for i in range(cfg.start_index, cfg.start_index + cfg.num_views):
         r = render_view(urdf, mesh_cache, rng, i, cfg, out, bg_sampler, mask_renderer)
         for k, v in r.items():
             totals[k] += v
