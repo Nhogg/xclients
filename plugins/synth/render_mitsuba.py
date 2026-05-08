@@ -17,8 +17,10 @@ import yourdfpy
 
 os.environ.setdefault("DRJIT_NO_LLVM_WARNING", "1")
 import mitsuba as mi
+from tqdm import tqdm
 
 mi.set_variant("cuda_ad_rgb")
+mi.set_log_level(mi.LogLevel.Error)
 
 from background import CocoBackgroundSampler
 from background import composite as composite_bg
@@ -29,6 +31,16 @@ HERE = Path(__file__).resolve().parent
 URDF_PATH = HERE / "xarm7_standalone.urdf"
 PLY_CACHE = HERE / "assets_ply"
 
+_MESH_BOUNDS_CACHE: dict[str, np.ndarray] = {}
+
+
+def _mesh_bounds(path: Path) -> np.ndarray:
+    """Return (2, 3) bounds array for a mesh, loading from disk only once."""
+    key = str(path)
+    if key not in _MESH_BOUNDS_CACHE:
+        _MESH_BOUNDS_CACHE[key] = np.asarray(trimesh.load(path, force="mesh").bounds)
+    return _MESH_BOUNDS_CACHE[key]
+
 ROOM_X = 4.5
 ROOM_Y_NEG = -4.5
 ROOM_Y_POS = 4.5
@@ -38,6 +50,7 @@ ROOM_MARGIN = 0.08
 
 CAMERA_APERTURE = 20.955
 FOCAL_LENGTH_BASE = 24.0
+INCH_TO_METER = 0.0254
 
 ARM_TIGHT_LIMITS_DEG = [
     (-120.0, 120.0),
@@ -324,8 +337,7 @@ def robot_bbox(urdf: yourdfpy.URDF, mesh_cache: dict[str, Path]) -> tuple[np.nda
         stem = _link_mesh_stem(urdf, link_name)
         if stem is None or stem not in mesh_cache:
             continue
-        m = trimesh.load(mesh_cache[stem], force="mesh")
-        pts = np.asarray(m.bounds)  # (2,3) in mesh local frame
+        pts = _mesh_bounds(mesh_cache[stem])  # (2,3) in mesh local frame
         corners = np.array([[x, y, z] for x in pts[:, 0] for y in pts[:, 1] for z in pts[:, 2]])
         corners_h = np.hstack([corners, np.ones((8, 1))])
         world = (link_xf @ corners_h.T).T[:, :3]
@@ -435,6 +447,14 @@ def camera_collides(eye, bbox_mn, bbox_mx, points) -> bool:
     return False
 
 
+def camera_radius_bounds_m(radius_min_in: float, radius_max_in: float) -> tuple[float, float]:
+    if radius_min_in <= 0.0 or radius_max_in <= 0.0:
+        raise ValueError(f"Camera radius bounds must be positive inches, got {radius_min_in}, {radius_max_in}.")
+    if radius_min_in >= radius_max_in:
+        raise ValueError(f"Camera radius min must be < max (inches), got {radius_min_in} >= {radius_max_in}.")
+    return radius_min_in * INCH_TO_METER, radius_max_in * INCH_TO_METER
+
+
 def build_scene_dict(
     urdf: yourdfpy.URDF,
     mesh_cache: dict[str, Path],
@@ -444,6 +464,11 @@ def build_scene_dict(
     image_width: int,
     image_height: int,
     focal_length: float,
+    radius_min_m: float,
+    radius_max_m: float,
+    *,
+    max_depth: int = 8,
+    force_all_emitters: bool = False,
 ) -> tuple[dict, dict, tuple]:
     robot_bb_mn, robot_bb_mx = robot_bbox(urdf, mesh_cache)
     wall_color = rand_scene_color(rng)
@@ -463,11 +488,14 @@ def build_scene_dict(
     fill_intensity = rng.uniform(0.0, 12.0)
     fill_color = rand_scene_color(rng)
 
-    # Camera sampling: sphere around a keypoint, biased to view_index azimuth.
+    # Camera sampling: bounded sphere around the robot base, biased to view_index azimuth.
     points = robot_world_keypoints(urdf)
+    by_name = dict(points)
+    if "base" not in by_name:
+        raise RuntimeError("Missing 'base' keypoint for camera sampling.")
     _, lookat_point = rng.choice(points)
-    _, sphere_point = rng.choice(points)
-    radius = rng.uniform(0.65, 2.4)
+    sphere_point = by_name["base"]
+    radius = rng.uniform(radius_min_m, radius_max_m)
     sin_el = rng.uniform(math.sin(math.radians(-25.0)), math.sin(math.radians(75.0)))
     cos_el = math.sqrt(max(0.0, 1.0 - sin_el * sin_el))
     azimuth = (360.0 * view_index / num_views) + rng.uniform(-55.0, 55.0)
@@ -507,7 +535,7 @@ def build_scene_dict(
 
     scene = {
         "type": "scene",
-        "integrator": {"type": "path", "max_depth": 8},
+        "integrator": {"type": "path", "max_depth": max_depth},
         "sensor": {
             "type": "perspective",
             "fov": fov_x,
@@ -526,7 +554,7 @@ def build_scene_dict(
         },
     }
 
-    if dome_intensity > 0:
+    if dome_intensity > 0 or force_all_emitters:
         scene["dome"] = {
             "type": "constant",
             "radiance": {
@@ -565,6 +593,12 @@ def build_scene_dict(
                     fill_color[2] * fill_intensity,
                 ],
             },
+        }
+    elif force_all_emitters:
+        scene["fill"] = {
+            "type": "directional",
+            "direction": dir_from_rpy((45.0, 35.0, 0.0)),
+            "irradiance": {"type": "rgb", "value": [0.0, 0.0, 0.0]},
         }
 
     # Room as 5 rectangles. Mitsuba rectangle is the [-1,1]^2 plane in XY at Z=0, normal +Z.
@@ -647,6 +681,9 @@ def build_scene_dict(
         "target": target,
         "rpy_deg": rpy_deg,
         "focal_length": focal_length,
+        "camera_radius_m": float(radius),
+        "camera_radius_bounds_m": [float(radius_min_m), float(radius_max_m)],
+        "camera_anchor": "base",
         "cam_to_world": cam_to_world,
         "fov_x": fov_x,
         "robot_bbox_mn": robot_bb_mn,
@@ -654,6 +691,67 @@ def build_scene_dict(
         "keypoints_world": points,
     }
     return scene, meta, (eye, target, rpy_deg)
+
+
+@dataclass
+class PersistentScene:
+    scene: object  # mi.Scene
+    params: object  # mi.SceneParameters
+    link_names: list[str]
+
+
+def _scene_dict_to_param_updates(scene_dict: dict, link_names: list[str]) -> dict:
+    """Extract a flat {traverse_key: value} dict from a scene_dict for in-place updates."""
+    p: dict = {}
+
+    s = scene_dict["sensor"]
+    p["sensor.to_world"] = s["to_world"]
+    p["sensor.x_fov"] = s["fov"]
+
+    p["dome.radiance.value"] = (
+        scene_dict["dome"]["radiance"]["value"] if "dome" in scene_dict else [0.0, 0.0, 0.0]
+    )
+
+    # Directional emitter directions are baked at load time and not traversable;
+    # only irradiance (color × intensity) is updated per frame.
+    p["sun.irradiance.value"] = scene_dict["sun"]["irradiance"]["value"]
+
+    if "fill" in scene_dict:
+        p["fill.irradiance.value"] = scene_dict["fill"]["irradiance"]["value"]
+    else:
+        p["fill.irradiance.value"] = [0.0, 0.0, 0.0]
+
+    for wall in ("ground", "backdrop", "left_wall", "right_wall", "front_wall"):
+        p[f"{wall}.bsdf.reflectance.value"] = scene_dict[wall]["bsdf"]["reflectance"]["value"]
+
+    for link_name in link_names:
+        key = f"robot_{link_name}"
+        if key not in scene_dict:
+            continue
+        p[f"{key}.to_world"] = scene_dict[key]["to_world"]
+        bsdf = scene_dict[key]["bsdf"]
+        p[f"{key}.bsdf.diffuse_reflectance.value"] = bsdf["diffuse_reflectance"]["value"]
+        p[f"{key}.bsdf.alpha"] = bsdf["alpha"]
+
+    return p
+
+
+def build_persistent_scene(urdf: yourdfpy.URDF, mesh_cache: dict[str, Path], cfg) -> PersistentScene:
+    """Load the Mitsuba scene once; subsequent renders update params in-place."""
+    rng = random.Random(0)
+    radius_min_m = cfg.camera_radius_min_in * INCH_TO_METER
+    radius_max_m = cfg.camera_radius_max_in * INCH_TO_METER
+    mid_focal = (cfg.fx_min + cfg.fx_max) / 2.0 * CAMERA_APERTURE / cfg.image_width
+    scene_dict, _, _ = build_scene_dict(
+        urdf, mesh_cache, rng, 0, max(cfg.num_views, 1),
+        cfg.image_width, cfg.image_height, mid_focal,
+        radius_min_m, radius_max_m,
+        force_all_emitters=True,
+    )
+    link_names = robot_visual_links(urdf)
+    scene = mi.load_dict(scene_dict)
+    params = mi.traverse(scene)
+    return PersistentScene(scene=scene, params=params, link_names=link_names)
 
 
 def intrinsics_from_focal(focal_length: float, width: int, height: int) -> dict:
@@ -715,8 +813,11 @@ def render_view(
     view_index: int,
     cfg,
     out_dir: Path,
+    radius_min_m: float,
+    radius_max_m: float,
     bg_sampler: CocoBackgroundSampler | None = None,
     mask_renderer: MaskRenderer | None = None,
+    denoiser: object | None = None,
 ):
     reject = {"room": 0, "self": 0, "camera": 0, "pose": 0, "dark": 0}
     image_path = out_dir / f"view_{view_index}.png"
@@ -761,10 +862,13 @@ def render_view(
             mesh_cache,
             rng,
             view_index,
-            cfg.num_views,
+            cfg.total_views,
             cfg.image_width,
             cfg.image_height,
             focal_length,
+            radius_min_m,
+            radius_max_m,
+            max_depth=cfg.max_depth,
         )
 
         if camera_collides(eye, meta["robot_bbox_mn"], meta["robot_bbox_mx"], points):
@@ -787,8 +891,7 @@ def render_view(
 
         scene = mi.load_dict(scene_dict)
         img = mi.render(scene, spp=cfg.spp)
-        if cfg.denoise:
-            denoiser = mi.OptixDenoiser(input_size=[cfg.image_width, cfg.image_height])
+        if cfg.denoise and denoiser is not None:
             img = denoiser(img)
         bmp = mi.Bitmap(img).convert(mi.Bitmap.PixelFormat.RGB, mi.Struct.Type.UInt8, srgb_gamma=True)
         rgb_arr = np.asarray(bmp).copy()
@@ -862,6 +965,7 @@ def render_view(
             "camera_target_world": list(target),
             "camera_rpy_deg": list(rpy_deg),
             "camera_focal_length": float(focal_length),
+            "camera_distance_from_base_m": float(meta["camera_radius_m"]),
             "reject_counts": reject,
             "visible_keypoint_count": visible,
             "background": sidecar_bg,
@@ -880,14 +984,15 @@ def render_view(
                     "camera_to_world": meta["cam_to_world"].tolist(),
                     "world_to_camera": world_to_cam.tolist(),
                 },
+                "sampling": {
+                    "anchor": meta["camera_anchor"],
+                    "radius_m": float(meta["camera_radius_m"]),
+                    "radius_bounds_m": list(meta["camera_radius_bounds_m"]),
+                    "radius_bounds_in": [float(cfg.camera_radius_min_in), float(cfg.camera_radius_max_in)],
+                },
             },
         }
         json_path.write_text(json.dumps(sidecar, indent=2))
-        print(
-            f"view_{view_index}: eye={tuple(round(v, 2) for v in eye)} "
-            f"target={tuple(round(v, 2) for v in target)} mean={mean:.1f} "
-            f"rejects={reject} visible={visible}"
-        )
         return reject
     raise RuntimeError(f"view_{view_index}: exhausted attempts {reject}")
 
@@ -901,10 +1006,15 @@ class Config:
     # Index of the first view this run writes (loop iterates
     # `range(start_index, start_index + num_views)`). Used to split a single
     # output directory across multiple machines without filename collisions —
-    # e.g. machine A: --start-index 0 --num-views 50000;
-    #      machine B: --start-index 50000 --num-views 50000 (with a different
-    #      --seed so poses don't duplicate).
+    # e.g. 4 GPUs each doing 25k of a 100k dataset:
+    #   GPU 0: --start-index 0     --num-views 25000 --total-views 100000 --seed S
+    #   GPU 1: --start-index 25000 --num-views 25000 --total-views 100000 --seed S+1
+    #   GPU 2: --start-index 50000 --num-views 25000 --total-views 100000 --seed S+2
+    #   GPU 3: --start-index 75000 --num-views 25000 --total-views 100000 --seed S+3
     start_index: int = 0
+    # Total views across all workers — used only for azimuth distribution so
+    # cameras spread evenly around 360°. Defaults to num_views (single-worker).
+    total_views: int = 0
     output_dir: Path = Path("renders/mitsuba_views")
     # Default ON to make multi-machine writes safe — wiping the shared dir
     # from one process would clobber the other's output. Pass --clean to
@@ -914,13 +1024,19 @@ class Config:
     image_height: int = 480
     fx_min: float = 450.0
     fx_max: float = 550.0
+    camera_radius_min_in: float = 14.0  # min camera radius from robot base in inches
+    camera_radius_max_in: float = 58.0  # max camera radius from robot base in inches
     spp: int = 4000
+    max_depth: int = 8  # path-tracer max bounce depth; 4–5 is enough with denoising
     denoise: bool = True  # apply OptiX denoiser post-render
     coco_dir: Path = Path("~/bafl/coco/train2014").expanduser()  # COCO bg images
     composite: bool = True  # composite robot over a random COCO image
 
 
 def main(cfg: Config) -> None:
+    if cfg.total_views == 0:
+        cfg.total_views = cfg.num_views
+    radius_min_m, radius_max_m = camera_radius_bounds_m(cfg.camera_radius_min_in, cfg.camera_radius_max_in)
     out = cfg.output_dir.resolve()
     if out.exists() and not cfg.no_clean:
         shutil.rmtree(out)
@@ -928,7 +1044,9 @@ def main(cfg: Config) -> None:
     print(
         f"Writing to {out} (seed={cfg.seed}, "
         f"views={cfg.start_index}..{cfg.start_index + cfg.num_views - 1}, "
-        f"spp={cfg.spp})"
+        f"spp={cfg.spp}, "
+        f"camera_radius={cfg.camera_radius_min_in:.1f}-{cfg.camera_radius_max_in:.1f}in/"
+        f"{radius_min_m:.3f}-{radius_max_m:.3f}m)"
     )
 
     mesh_cache = ensure_ply_cache()
@@ -944,13 +1062,34 @@ def main(cfg: Config) -> None:
         bg_sampler = CocoBackgroundSampler(cfg.coco_dir, rng=random.Random(cfg.seed + 1))
         print(f"Compositing over {len(bg_sampler)} COCO images from {cfg.coco_dir}")
 
+    denoiser = None
+    if cfg.denoise:
+        denoiser = mi.OptixDenoiser(input_size=[cfg.image_width, cfg.image_height])
+        print("OptiX denoiser initialised.")
+
     rng = random.Random(cfg.seed)
     totals = {"room": 0, "self": 0, "camera": 0, "pose": 0, "dark": 0}
-    for i in range(cfg.start_index, cfg.start_index + cfg.num_views):
-        r = render_view(urdf, mesh_cache, rng, i, cfg, out, bg_sampler, mask_renderer)
-        for k, v in r.items():
-            totals[k] += v
-    print(f"Wrote renders to {out}")
+    view_range = range(cfg.start_index, cfg.start_index + cfg.num_views)
+    with tqdm(total=cfg.num_views, unit="view", dynamic_ncols=True) as bar:
+        for i in view_range:
+            r = render_view(
+                urdf,
+                mesh_cache,
+                rng,
+                i,
+                cfg,
+                out,
+                radius_min_m,
+                radius_max_m,
+                bg_sampler,
+                mask_renderer,
+                denoiser,
+            )
+            for k, v in r.items():
+                totals[k] += v
+            bar.update(1)
+            bar.set_postfix(rejects=sum(totals.values()))
+    print(f"Wrote {cfg.num_views} renders to {out}")
     print(f"Total rejects: {totals}")
 
 
