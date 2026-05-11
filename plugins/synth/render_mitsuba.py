@@ -52,16 +52,24 @@ CAMERA_APERTURE = 20.955
 FOCAL_LENGTH_BASE = 24.0
 INCH_TO_METER = 0.0254
 
+ARM_PHYSICAL_LIMITS_DEG = [
+    (-360.0, 360.0),   # joint1
+    (-118.0, 120.0),   # joint2
+    (-360.0, 360.0),   # joint3
+    (-11.0,  225.0),   # joint4
+    (-360.0, 360.0),   # joint5
+    (-97.0,  180.0),   # joint6
+    (-360.0, 360.0),   # joint7
+]
 ARM_TIGHT_LIMITS_DEG = [
     (-120.0, 120.0),
-    (-90.0, 60.0),
+    (-90.0,   60.0),
     (-150.0, 150.0),
-    (-11.0, 100.0),
+    (-11.0,  100.0),
     (-150.0, 150.0),
-    (-90.0, 90.0),
+    (-90.0,   90.0),
     (-175.0, 175.0),
 ]
-ARM_FULL_LIMITS_DEG = [170.0, 110.0, 165.0, 120.0, 165.0, 110.0, 175.0]
 
 
 def robot_visual_links(urdf: yourdfpy.URDF) -> list[str]:
@@ -207,7 +215,7 @@ def sample_joints_tight(rng) -> list[float]:
 
 
 def sample_joints_full(rng) -> list[float]:
-    return [rng.uniform(-lim, lim) for lim in ARM_FULL_LIMITS_DEG]
+    return [rng.uniform(lo, hi) for lo, hi in ARM_PHYSICAL_LIMITS_DEG]
 
 
 def sample_joints_ik(rng) -> list[float] | None:
@@ -528,10 +536,8 @@ def build_scene_dict(
         "type": "diffuse",
         "reflectance": {"type": "rgb", "value": list(backdrop_color)},
     }
-    wall_bsdf = {
-        "type": "diffuse",
-        "reflectance": {"type": "rgb", "value": list(wall_color)},
-    }
+    def _wall_bsdf():
+        return {"type": "diffuse", "reflectance": {"type": "rgb", "value": list(wall_color)}}
 
     scene = {
         "type": "scene",
@@ -635,7 +641,7 @@ def build_scene_dict(
             ROOM_Y_POS,
             (ROOM_Z_MAX - ROOM_Z_MIN) / 2,
             (1, 0, 0),
-            wall_bsdf,
+            _wall_bsdf(),
         ),
         (
             "right_wall",
@@ -643,7 +649,7 @@ def build_scene_dict(
             ROOM_Y_POS,
             (ROOM_Z_MAX - ROOM_Z_MIN) / 2,
             (-1, 0, 0),
-            wall_bsdf,
+            _wall_bsdf(),
         ),
         (
             "front_wall",
@@ -651,7 +657,7 @@ def build_scene_dict(
             ROOM_X,
             (ROOM_Z_MAX - ROOM_Z_MIN) / 2,
             (0, -1, 0),
-            wall_bsdf,
+            _wall_bsdf(),
         ),
     ]
     for name, center, eu, ev, normal, bsdf in walls:
@@ -698,9 +704,12 @@ class PersistentScene:
     scene: object  # mi.Scene
     params: object  # mi.SceneParameters
     link_names: list[str]
+    side_wall_key: str | None  # traversal key for the merged left/right/front wall shape
+    link_local_verts: dict   # link_name -> (N,3) float32 vertices in local mesh space
+    link_local_normals: dict  # link_name -> (N,3) float32 normals in local mesh space
 
 
-def _scene_dict_to_param_updates(scene_dict: dict, link_names: list[str]) -> dict:
+def _scene_dict_to_param_updates(scene_dict: dict, ps: "PersistentScene") -> dict:
     """Extract a flat {traverse_key: value} dict from a scene_dict for in-place updates."""
     p: dict = {}
 
@@ -721,14 +730,34 @@ def _scene_dict_to_param_updates(scene_dict: dict, link_names: list[str]) -> dic
     else:
         p["fill.irradiance.value"] = [0.0, 0.0, 0.0]
 
-    for wall in ("ground", "backdrop", "left_wall", "right_wall", "front_wall"):
+    for wall in ("ground", "backdrop"):
         p[f"{wall}.bsdf.reflectance.value"] = scene_dict[wall]["bsdf"]["reflectance"]["value"]
 
-    for link_name in link_names:
+    # Mitsuba merges left/right/front walls (same wall_color → same BSDF) into one compound
+    # shape with an auto-generated key; update that single shape with the shared wall color.
+    if ps.side_wall_key is not None:
+        p[f"{ps.side_wall_key}.bsdf.reflectance.value"] = (
+            scene_dict["left_wall"]["bsdf"]["reflectance"]["value"]
+        )
+
+    # PLY shapes bake to_world into vertex_positions at load time; update by retransforming
+    # the stored local-space vertices with the new per-frame joint transform.
+    for link_name, local_verts in ps.link_local_verts.items():
         key = f"robot_{link_name}"
         if key not in scene_dict:
             continue
-        p[f"{key}.to_world"] = scene_dict[key]["to_world"]
+        T = np.array(scene_dict[key]["to_world"].matrix, dtype=np.float64)
+        N = len(local_verts)
+        verts_h = np.column_stack([local_verts.astype(np.float64), np.ones(N)])
+        new_verts = (T @ verts_h.T).T[:, :3].astype(np.float32)
+        p[f"{key}.vertex_positions"] = new_verts.flatten()
+        local_normals = ps.link_local_normals.get(link_name)
+        if local_normals is not None:
+            R = T[:3, :3]
+            new_normals = (R @ local_normals.astype(np.float64).T).T
+            norms = np.linalg.norm(new_normals, axis=1, keepdims=True)
+            new_normals = new_normals / np.maximum(norms, 1e-8)
+            p[f"{key}.vertex_normals"] = new_normals.astype(np.float32).flatten()
         bsdf = scene_dict[key]["bsdf"]
         p[f"{key}.bsdf.diffuse_reflectance.value"] = bsdf["diffuse_reflectance"]["value"]
         p[f"{key}.bsdf.alpha"] = bsdf["alpha"]
@@ -749,9 +778,53 @@ def build_persistent_scene(urdf: yourdfpy.URDF, mesh_cache: dict[str, Path], cfg
         force_all_emitters=True,
     )
     link_names = robot_visual_links(urdf)
+
+    # All robot links share the same robot_bsdf dict in build_scene_dict, so Mitsuba merges
+    # them into one compound shape.  Apply a negligible per-link alpha offset so each link
+    # gets a distinct BSDF instance and stays traversable separately.
+    for i, link_name in enumerate(link_names):
+        key = f"robot_{link_name}"
+        if key not in scene_dict:
+            continue
+        orig = scene_dict[key]["bsdf"]
+        scene_dict[key] = {
+            **scene_dict[key],
+            "bsdf": {**orig, "alpha": orig["alpha"] + (i + 1) * 1e-6},
+        }
+
     scene = mi.load_dict(scene_dict)
     params = mi.traverse(scene)
-    return PersistentScene(scene=scene, params=params, link_names=link_names)
+
+    # The three side walls share wall_color so Mitsuba merges them into one compound shape
+    # with an auto-generated key.  Detect it: the only non-robot reflectance key that isn't
+    # ground or backdrop.
+    side_wall_key = None
+    for k in sorted(params.keys()):
+        if k.endswith(".bsdf.reflectance.value"):
+            base = k[: -len(".bsdf.reflectance.value")]
+            if base not in ("ground", "backdrop"):
+                side_wall_key = base
+                break
+
+    # Load local-space vertices/normals from PLY files so we can retransform them per frame.
+    link_local_verts: dict = {}
+    link_local_normals: dict = {}
+    for link_name in link_names:
+        stem = _link_mesh_stem(urdf, link_name)
+        if stem is None or stem not in mesh_cache:
+            continue
+        mesh = trimesh.load(str(mesh_cache[stem]), process=False, force="mesh")
+        link_local_verts[link_name] = np.asarray(mesh.vertices, dtype=np.float32)
+        link_local_normals[link_name] = np.asarray(mesh.vertex_normals, dtype=np.float32)
+
+    return PersistentScene(
+        scene=scene,
+        params=params,
+        link_names=link_names,
+        side_wall_key=side_wall_key,
+        link_local_verts=link_local_verts,
+        link_local_normals=link_local_normals,
+    )
 
 
 def intrinsics_from_focal(focal_length: float, width: int, height: int) -> dict:
@@ -818,6 +891,7 @@ def render_view(
     bg_sampler: CocoBackgroundSampler | None = None,
     mask_renderer: MaskRenderer | None = None,
     denoiser: object | None = None,
+    persistent_scene: PersistentScene | None = None,
 ):
     reject = {"room": 0, "self": 0, "camera": 0, "pose": 0, "dark": 0}
     image_path = out_dir / f"view_{view_index}.png"
@@ -889,8 +963,15 @@ def render_view(
             reject["pose"] += 1
             continue
 
-        scene = mi.load_dict(scene_dict)
-        img = mi.render(scene, spp=cfg.spp)
+        if persistent_scene is not None:
+            updates = _scene_dict_to_param_updates(scene_dict, persistent_scene)
+            for k, v in updates.items():
+                persistent_scene.params[k] = v
+            persistent_scene.params.update()
+            img = mi.render(persistent_scene.scene, spp=cfg.spp)
+        else:
+            scene = mi.load_dict(scene_dict)
+            img = mi.render(scene, spp=cfg.spp)
         if cfg.denoise and denoiser is not None:
             img = denoiser(img)
         bmp = mi.Bitmap(img).convert(mi.Bitmap.PixelFormat.RGB, mi.Struct.Type.UInt8, srgb_gamma=True)
@@ -1026,11 +1107,12 @@ class Config:
     fx_max: float = 550.0
     camera_radius_min_in: float = 14.0  # min camera radius from robot base in inches
     camera_radius_max_in: float = 58.0  # max camera radius from robot base in inches
-    spp: int = 4000
-    max_depth: int = 8  # path-tracer max bounce depth; 4–5 is enough with denoising
+    spp: int = 128
+    max_depth: int = 4  # path-tracer max bounce depth; 4–5 is enough with denoising
     denoise: bool = True  # apply OptiX denoiser post-render
     coco_dir: Path = Path("~/bafl/coco/train2014").expanduser()  # COCO bg images
     composite: bool = True  # composite robot over a random COCO image
+    progress_file: Path | None = None  # if set, write "done total" here after each view
 
 
 def main(cfg: Config) -> None:
@@ -1067,10 +1149,15 @@ def main(cfg: Config) -> None:
         denoiser = mi.OptixDenoiser(input_size=[cfg.image_width, cfg.image_height])
         print("OptiX denoiser initialised.")
 
+    ps = build_persistent_scene(urdf, mesh_cache, cfg)
+    print("Persistent Mitsuba scene loaded.")
+
     rng = random.Random(cfg.seed)
     totals = {"room": 0, "self": 0, "camera": 0, "pose": 0, "dark": 0}
     view_range = range(cfg.start_index, cfg.start_index + cfg.num_views)
-    with tqdm(total=cfg.num_views, unit="view", dynamic_ncols=True) as bar:
+    done = 0
+    use_bar = cfg.progress_file is None
+    with tqdm(total=cfg.num_views, unit="view", dynamic_ncols=True, disable=not use_bar) as bar:
         for i in view_range:
             r = render_view(
                 urdf,
@@ -1084,9 +1171,15 @@ def main(cfg: Config) -> None:
                 bg_sampler,
                 mask_renderer,
                 denoiser,
+                ps,
             )
             for k, v in r.items():
                 totals[k] += v
+            done += 1
+            if cfg.progress_file is not None:
+                tmp = cfg.progress_file.with_suffix(".tmp")
+                tmp.write_text(f"{done} {cfg.num_views}\n")
+                tmp.replace(cfg.progress_file)
             bar.update(1)
             bar.set_postfix(rejects=sum(totals.values()))
     print(f"Wrote {cfg.num_views} renders to {out}")
