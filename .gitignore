@@ -1,6 +1,9 @@
 *.rrd
 data/
 
+# ycb
+./plugins/synth/assets/ycb/models
+
 #yolo
 *.pt
 
