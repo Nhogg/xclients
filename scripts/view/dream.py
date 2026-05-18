@@ -4,6 +4,7 @@ from collections import deque
 from dataclasses import dataclass, field
 import logging
 from pathlib import Path
+import sys
 import time
 
 import cv2
@@ -482,6 +483,9 @@ def main(cfg: Config) -> None:
 
                 pts_cam = None
                 try:
+                    crossformer_root = Path.home() / "crossformer"
+                    if crossformer_root.exists() and str(crossformer_root) not in sys.path:
+                        sys.path.insert(0, str(crossformer_root))
                     from crossformer.utils.callbacks.synth_viz import fk_keypoints
 
                     q_deg = np.asarray(cfg.q, dtype=np.float64)
