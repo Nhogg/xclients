@@ -450,11 +450,24 @@ def main(cfg: Config) -> None:
         if pose is not None:
             calibration = dream_camera_calibration(k_orig, pose, w, h)
             calibration["extrinsics"] = pose
-
+        print(f"depth raw shape", depth_raw.shape)
         if depth_raw is not None and calibration is not None:
             depth_intr = first_array(da_out.get("intrinsics") if da_out else None)
+            print("viewer depth_raw shape", depth_raw.shape)
+            print("viewer da_out intrinsics raw", da_out.get("intrinsics") if da_out else None)
             if depth_intr is None:
-                depth_intr = k_orig
+                print("viewer hitting depth_intr fallback")
+                dh, dw = depth_raw.shape
+                depth_intr = scale_intrinsics(k_orig, dw / float(w), dh / float(h))
+                print("Viewer fallback depth_intr", depth_intr)
+            else:
+                print("viewer using DA3 depth_intr", depth_intr)
+
+            print("da3 is_metric", da_out.get("is_metric") if da_out else None)
+            print("depth min / max", np.nanmin(depth_raw), np.nanmax(depth_raw))
+            print("dream w2c", pose)
+            print("dream pnp reproj", out.get("pnp_reproj_px") if out else None)
+            print("dream mask_iou", out.get("mask.iou") f out else None)
             try:
                 points_cam, colors_rgb = unproject_depth_points(
                     depth_raw,
