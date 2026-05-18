@@ -457,8 +457,55 @@ def main(cfg: Config) -> None:
 
         if depth_raw is not None and calibration is not None:
             depth_intr = first_array(da_out.get("intrinsics") if da_out else None)
+            print("viewer depth_raw shape", depth_raw.shape)
+            print("viewer da_out intrinsics raw", da_out.get("intrinsics") if da_out else None)
             if depth_intr is None:
-                depth_intr = k_orig
+                print("viewer hitting depth_intr fallback")
+                dh, dw = depth_raw.shape
+                depth_intr = scale_intrinsics(k_orig, dw / float(w), dh / float(h))
+                print("viewer fallback depth_intr", depth_intr)
+            else:
+                print("viewer using DA3 depth_intr", depth_intr)
+            print("da3 is_metric", da_out.get("is_metric") if da_out else None)
+            print("da3 scale_factor", da_out.get("scale_factor") if da_out else None)
+            print("depth min / max", np.nanmin(depth_raw), np.nanmax(depth_raw))
+            print("dream w2c", pose)
+            print("dream pnp reproj", out.get("pnp_reproj_px") if out else None)
+            print("dream mask_iou", out.get("mask_iou") if out else None)
+
+            keypoints = out.get("keypoints") if out else None
+            if keypoints is not None and pose is not None:
+                kps = np.asarray(keypoints)
+                while kps.ndim > 2 and kps.shape[0] == 1:
+                    kps = kps[0]
+                print("dream keypoint net", kps)
+
+                pts_cam = None
+                try:
+                    from crossformer.utils.callbacks.synth_viz import fk_keypoints
+
+                    q_deg = np.asarray(cfg.q, dtype=np.float64)
+                    joints_rad = np.deg2rad(q_deg[:7])
+                    pts_world = fk_keypoints(joints_rad)
+                    pts_cam = (pose[:3, :3] @ pts_world.T).T + pose[:3, 3]
+                    print("dream expected kp camera z", pts_cam[:, 2])
+                except (ImportError, ModuleNotFoundError) as exc:
+                    print("could not import fk_keypoints for depth compare", exc)
+
+                sx = depth_raw.shape[1] / float(cfg.image_size)
+                sy = depth_raw.shape[0] / float(cfg.image_size)
+                for i, uv in enumerate(kps):
+                    if uv[0] < -900:
+                        continue
+                    x = int(round(float(uv[0]) * sx))
+                    y = int(round(float(uv[1]) * sy))
+                    if 0 <= x < depth_raw.shape[1] and 0 <= y < depth_raw.shape[0]:
+                        da_z = float(depth_raw[y, x])
+                        if pts_cam is not None and i < len(pts_cam):
+                            dream_z = float(pts_cam[i, 2])
+                            print("kp depth compare", i, "px", x, y, "da_z", da_z, "dream_z", dream_z, "ratio", da_z / dream_z)
+                        else:
+                            print("kp depth", i, "px", x, y, "da_z", da_z)
             try:
                 points_cam, colors_rgb = unproject_depth_points(
                     depth_raw,
