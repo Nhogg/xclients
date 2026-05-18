@@ -471,7 +471,7 @@ def main(cfg: Config) -> None:
             print("depth min / max", np.nanmin(depth_raw), np.nanmax(depth_raw))
             print("dream w2c", pose)
             print("dream pnp reproj", out.get("pnp_reproj_px") if out else None)
-            print("dream mask_iou", out.get("mask.iou") f out else None)
+            print("dream mask_iou", out.get("mask.iou") if out else None)
             try:
                 points_cam, colors_rgb = unproject_depth_points(
                     depth_raw,
