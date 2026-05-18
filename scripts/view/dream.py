@@ -429,7 +429,11 @@ def main(cfg: Config) -> None:
                 "image": [frame],
                 "intrinsics": np.array([k_orig], dtype=np.float32),
             }
+            print("DA3 input k_orig", k_orig)
+            print("DA3 input frame shape", frame.shape)
             da_out = da_client.step(da_payload)
+            print("DA3 output intrinsics", first_array(da_out.get("intrinsics")))
+            print("DA3 output depth shape", first_array(da_out.get("depth")).shape)
 
         mask = draw_mask(out.get("mask") if out else None)
         raster_raw = out.get("raster_image") if out else None
