@@ -454,7 +454,7 @@ def main(cfg: Config) -> None:
         if pose is not None:
             calibration = dream_camera_calibration(k_orig, pose, w, h)
             calibration["extrinsics"] = pose
-
+        print("depth raw shape", depth_raw.shape)
         if depth_raw is not None and calibration is not None:
             depth_intr = first_array(da_out.get("intrinsics") if da_out else None)
             print("viewer depth_raw shape", depth_raw.shape)
@@ -503,7 +503,19 @@ def main(cfg: Config) -> None:
                         da_z = float(depth_raw[y, x])
                         if pts_cam is not None and i < len(pts_cam):
                             dream_z = float(pts_cam[i, 2])
-                            print("kp depth compare", i, "px", x, y, "da_z", da_z, "dream_z", dream_z, "ratio", da_z / dream_z)
+                            print(
+                                "kp depth compare",
+                                i,
+                                "px",
+                                x,
+                                y,
+                                "da_z",
+                                da_z,
+                                "dream_z",
+                                dream_z,
+                                "ratio",
+                                da_z / dream_z,
+                            )
                         else:
                             print("kp depth", i, "px", x, y, "da_z", da_z)
             try:
