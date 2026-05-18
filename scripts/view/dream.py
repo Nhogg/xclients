@@ -472,6 +472,22 @@ def main(cfg: Config) -> None:
             print("dream w2c", pose)
             print("dream pnp reproj", out.get("pnp_reproj_px") if out else None)
             print("dream mask_iou", out.get("mask.iou") if out else None)
+
+            kps = out.get("keypoints")
+            if kps is not None and pose is not None:
+                kps = np.asarray(kps)
+                while kps.ndim > 2 and kps.shape[0] == 1:
+                    kps = kps[0]
+                sx = depth_raw.shape[1] / float(cfg.image_size)
+                sy = depth_raw.shape[0] / float(cfg.image_size)
+
+                print("dream keypoint net", kps)
+                for uv in kps:
+                    x = int(round(float(uv[0])) * sx)
+                    y = int(round(float(uv[1])) * sy)
+                    if 0 <= x < depth_raw.shape[1] and 0 <= y < depth_raw.shape[0]:
+                        print("kp depth", x, y, float(depth_raw[y, x]))
+
             try:
                 points_cam, colors_rgb = unproject_depth_points(
                     depth_raw,
