@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+from pathlib import Path
 
 import numpy as np
-from roboreg.differentiable import VirtualCamera
+from roboreg.differentiable import NVDiffRastRenderer, Robot, RobotScene, VirtualCamera
+from roboreg.io import URDFParser
 from roboreg.util import overlay_mask
 from roboreg.util.factories import create_robot_scene
 import torch
@@ -54,16 +56,27 @@ class Renderer:
             )
         }
 
-        self.scene = create_robot_scene(
-            batch_size=rcfg.batch_size,
-            ros_package=cfg.ros_package,
-            xacro_path=cfg.xacro_path,
-            root_link_name=cfg.root_link_name,
-            end_link_name=cfg.end_link_name,
-            cameras=camera,
-            device=self.device,
-            collision=cfg.collision_meshes,
-        )
+        if cfg.urdf:
+            self.scene = create_robot_scene_from_urdf(
+                batch_size=rcfg.batch_size,
+                urdf_path=cfg.urdf,
+                root_link_name=cfg.root_link_name,
+                end_link_name=cfg.end_link_name,
+                cameras=camera,
+                device=self.device,
+                collision=cfg.collision_meshes,
+            )
+        else:
+            self.scene = create_robot_scene(
+                batch_size=rcfg.batch_size,
+                ros_package=cfg.ros_package,
+                xacro_path=cfg.xacro_path,
+                root_link_name=cfg.root_link_name,
+                end_link_name=cfg.end_link_name,
+                cameras=camera,
+                device=self.device,
+                collision=cfg.collision_meshes,
+            )
 
         self.camera = camera
         self.color = rcfg.color
@@ -125,3 +138,49 @@ class Renderer:
             overlays.append(overlay_mask(im, render_masks[0], self.color, scale=1.0))
 
         return {"overlays": overlays}
+
+
+class LocalURDFParser(URDFParser):
+    def __init__(self, urdf_dir: Path) -> None:
+        super().__init__()
+        self.urdf_dir = urdf_dir
+
+    def ros_package_mesh_paths(
+        self, root_link_name: str, end_link_name: str, collision: bool = False
+    ) -> dict[str, str]:
+        paths = {}
+        for link_name, raw_path in self.raw_mesh_paths(root_link_name, end_link_name, collision=collision).items():
+            if raw_path.startswith("package://"):
+                raise ValueError(f"Standalone URDF cannot resolve ROS package mesh path {raw_path!r}")
+            path = Path(raw_path)
+            paths[link_name] = str(path if path.is_absolute() else self.urdf_dir / path)
+        return paths
+
+
+def create_robot_scene_from_urdf(
+    batch_size: int,
+    urdf_path: Path,
+    root_link_name: str,
+    end_link_name: str,
+    cameras: dict[str, VirtualCamera],
+    device: torch.device | str,
+    collision: bool = False,
+) -> RobotScene:
+    urdf_path = Path(urdf_path).expanduser().resolve()
+    parser = LocalURDFParser(urdf_path.parent)
+    parser.from_urdf(urdf_path.read_text())
+
+    if root_link_name == "":
+        root_link_name = parser.link_names_with_meshes(collision=collision)[0]
+    if end_link_name == "":
+        end_link_name = parser.link_names_with_meshes(collision=collision)[-1]
+
+    robot = Robot(
+        urdf_parser=parser,
+        root_link_name=root_link_name,
+        end_link_name=end_link_name,
+        collision=collision,
+        batch_size=batch_size,
+        device=device,
+    )
+    return RobotScene(cameras=cameras, robot=robot, renderer=NVDiffRastRenderer(device=device))

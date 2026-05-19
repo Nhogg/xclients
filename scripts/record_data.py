@@ -44,6 +44,8 @@ def open_arm(robot_ip: str | None):
 def read_joints(arm, cfg: Config) -> np.ndarray:
     if arm is not None:
         return np.asarray(arm.angles, dtype=np.float32).reshape(-1)
+    else:
+        raise FileNotFoundError
 
     q = np.asarray(cfg.q, dtype=np.float32)
     return np.deg2rad(q).astype(np.float32) if cfg.deg2rad else q

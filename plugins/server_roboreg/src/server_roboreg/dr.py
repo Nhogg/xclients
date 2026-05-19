@@ -158,6 +158,8 @@ class DR:
                 loss = soft_dice_loss(targets, renders["camera"]).mean()
             else:
                 raise ValueError("Invalid registration mode.")
+            print("targets", targets.sum(), targets.mean())
+            print("renders", renders["camera"].sum(), renders["camera"].mean())
 
             optimizer.zero_grad()
             loss.backward()
@@ -201,6 +203,7 @@ class DR:
 
             out = {
                 "overlays": overlay,
+                "renders": rmask,
                 # 'difference': (difference* 255.0).astype(np.uint8),
                 "difference": difference,
             }
