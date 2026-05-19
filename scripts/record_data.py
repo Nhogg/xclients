@@ -322,13 +322,10 @@ def main(cfg: Config) -> None:
             if raster is not None:
                 logging.info("Dream raster display shape=%s dtype=%s", raster.shape, raster.dtype)
             mask = dream_mask(out.get("mask"))
-<<<<<<< HEAD
-=======
             mask_raw = dream_mask_raw(out.get("mask"))
             extrinsics = dream_extrinsics(out)
             if extrinsics is not None:
                 logging.info("Dream extrinsics w2c=%s", extrinsics)
->>>>>>> 194541670afeac8fa10bd04960d10778a15b93ca
             raster_on_frame = raster_overlay(frame, raster)
             overlay = mask_overlay(frame, out.get("mask"))
             if raster is None and mask is None:
@@ -344,11 +341,7 @@ def main(cfg: Config) -> None:
             if overlay is not None:
                 cv2.imshow("mask overlay", overlay)
             if save:
-<<<<<<< HEAD
-                save_record(cfg, frame, model_frames, q, k, raster, mask)
-=======
                 save_record(cfg, frame, model_frames, q, k, raster, mask, mask_raw, extrinsics)
->>>>>>> 194541670afeac8fa10bd04960d10778a15b93ca
             logging.info("Captured save=%s q=%s Dream keys=%s", save, q.tolist(), sorted(out))
     finally:
         cap.release()
