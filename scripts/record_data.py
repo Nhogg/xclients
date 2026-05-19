@@ -116,6 +116,21 @@ def dream_raster(out: dict) -> np.ndarray | None:
     return None
 
 
+<<<<<<< HEAD
+=======
+def dream_extrinsics(out: dict) -> np.ndarray | None:
+    for key in ("w2c", "HT", "extrinsics"):
+        if key in out:
+            pose = np.asarray(out[key], dtype=np.float32)
+            while pose.ndim > 2 and pose.shape[0] == 1:
+                pose = pose[0]
+            if pose.shape == (4, 4):
+                return pose
+            logging.warning("Ignoring Dream %s with unexpected shape %s", key, pose.shape)
+    return None
+
+
+>>>>>>> 194541670afeac8fa10bd04960d10778a15b93ca
 def raster_overlay(frame: np.ndarray, raster: np.ndarray | None) -> np.ndarray | None:
     if raster is None:
         return None
@@ -155,6 +170,21 @@ def dream_mask(mask: object | None) -> np.ndarray | None:
     return cv2.applyColorMap(mask_u8, cv2.COLORMAP_TURBO)
 
 
+<<<<<<< HEAD
+=======
+def dream_mask_raw(mask: object | None) -> np.ndarray | None:
+    if mask is None:
+        return None
+
+    arr = first_image(mask).astype(np.float32)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected mask with shape (h, w) or batched singleton variants, got {arr.shape}")
+    if arr.size and float(np.nanmax(arr)) > 1.0:
+        arr = arr / 255.0
+    return np.clip(arr * 255.0, 0.0, 255.0).astype(np.uint8)
+
+
+>>>>>>> 194541670afeac8fa10bd04960d10778a15b93ca
 def mask_overlay(frame: np.ndarray, mask: object | None) -> np.ndarray | None:
     if mask is None:
         return None
@@ -221,6 +251,8 @@ def save_record(
     k: np.ndarray,
     raster: np.ndarray | None,
     mask: np.ndarray | None,
+    mask_raw: np.ndarray | None,
+    extrinsics: np.ndarray | None,
 ) -> None:
     if cfg.save_dir is None:
         return
@@ -233,6 +265,24 @@ def save_record(
     if mask is not None:
         cv2.imwrite(str(cfg.save_dir / f"{stem}_mask.png"), mask)
     np.savez(cfg.save_dir / f"{stem}.npz", image=frame, image_model=model_frames, joints=q, K=k, raster=raster, mask=mask)
+    if mask_raw is not None:
+        cv2.imwrite(str(cfg.save_dir / f"{stem}_mask_raw.png"), mask_raw)
+
+    arrays = {
+        "image": frame,
+        "image_model": model_frames,
+        "joints": q,
+        "K": k,
+    }
+    if raster is not None:
+        arrays["raster"] = raster
+    if mask is not None:
+        arrays["mask"] = mask
+    if mask_raw is not None:
+        arrays["mask_raw"] = mask_raw
+    if extrinsics is not None:
+        arrays["w2c"] = extrinsics
+    np.savez(cfg.save_dir / f"{stem}.npz", **arrays)
 
 
 def main(cfg: Config) -> None:
@@ -272,6 +322,13 @@ def main(cfg: Config) -> None:
             if raster is not None:
                 logging.info("Dream raster display shape=%s dtype=%s", raster.shape, raster.dtype)
             mask = dream_mask(out.get("mask"))
+<<<<<<< HEAD
+=======
+            mask_raw = dream_mask_raw(out.get("mask"))
+            extrinsics = dream_extrinsics(out)
+            if extrinsics is not None:
+                logging.info("Dream extrinsics w2c=%s", extrinsics)
+>>>>>>> 194541670afeac8fa10bd04960d10778a15b93ca
             raster_on_frame = raster_overlay(frame, raster)
             overlay = mask_overlay(frame, out.get("mask"))
             if raster is None and mask is None:
@@ -287,7 +344,11 @@ def main(cfg: Config) -> None:
             if overlay is not None:
                 cv2.imshow("mask overlay", overlay)
             if save:
+<<<<<<< HEAD
                 save_record(cfg, frame, model_frames, q, k, raster, mask)
+=======
+                save_record(cfg, frame, model_frames, q, k, raster, mask, mask_raw, extrinsics)
+>>>>>>> 194541670afeac8fa10bd04960d10778a15b93ca
             logging.info("Captured save=%s q=%s Dream keys=%s", save, q.tolist(), sorted(out))
     finally:
         cap.release()
