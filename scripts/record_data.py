@@ -260,6 +260,7 @@ def save_record(
         cv2.imwrite(str(cfg.save_dir / f"{stem}_raster.png"), raster)
     if mask is not None:
         cv2.imwrite(str(cfg.save_dir / f"{stem}_mask.png"), mask)
+    np.savez(cfg.save_dir / f"{stem}.npz", image=frame, image_model=model_frames, joints=q, K=k, raster=raster, mask=mask)
     if mask_raw is not None:
         cv2.imwrite(str(cfg.save_dir / f"{stem}_mask_raw.png"), mask_raw)
 
