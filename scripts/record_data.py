@@ -116,8 +116,6 @@ def dream_raster(out: dict) -> np.ndarray | None:
     return None
 
 
-<<<<<<< HEAD
-=======
 def dream_extrinsics(out: dict) -> np.ndarray | None:
     for key in ("w2c", "HT", "extrinsics"):
         if key in out:
@@ -130,7 +128,6 @@ def dream_extrinsics(out: dict) -> np.ndarray | None:
     return None
 
 
->>>>>>> 194541670afeac8fa10bd04960d10778a15b93ca
 def raster_overlay(frame: np.ndarray, raster: np.ndarray | None) -> np.ndarray | None:
     if raster is None:
         return None
@@ -170,8 +167,6 @@ def dream_mask(mask: object | None) -> np.ndarray | None:
     return cv2.applyColorMap(mask_u8, cv2.COLORMAP_TURBO)
 
 
-<<<<<<< HEAD
-=======
 def dream_mask_raw(mask: object | None) -> np.ndarray | None:
     if mask is None:
         return None
@@ -184,7 +179,6 @@ def dream_mask_raw(mask: object | None) -> np.ndarray | None:
     return np.clip(arr * 255.0, 0.0, 255.0).astype(np.uint8)
 
 
->>>>>>> 194541670afeac8fa10bd04960d10778a15b93ca
 def mask_overlay(frame: np.ndarray, mask: object | None) -> np.ndarray | None:
     if mask is None:
         return None
