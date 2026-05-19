@@ -31,13 +31,57 @@ class DR:
         self.modefn = mask_distance_transform if mode == REGISTRATION_MODE.DISTANCE_FUNCTION else mask_exponential_decay
         self.r = None
 
+    @staticmethod
+    def _as_batch(value: object, name: str) -> np.ndarray:
+        arr = np.asarray(value)
+        if arr.ndim == 2:
+            arr = arr[None]
+        if arr.ndim == 3 and name in {"image", "images"} and arr.shape[-1] in (1, 3, 4):
+            arr = arr[None]
+        if arr.ndim < 3:
+            raise ValueError(f"Expected batched {name}, got shape {arr.shape}")
+        return arr
+
+    @staticmethod
+    def _normalize_image(image: np.ndarray) -> np.ndarray:
+        image = np.asarray(image)
+        if image.ndim == 2:
+            image = np.stack([image] * 3, axis=-1)
+        if image.ndim == 3 and image.shape[-1] == 1:
+            image = np.repeat(image, 3, axis=-1)
+        if image.ndim == 3 and image.shape[-1] == 4:
+            image = image[..., :3]
+        if image.ndim != 3 or image.shape[-1] != 3:
+            raise ValueError(f"Expected image with shape (h, w, 3), got {image.shape}")
+
+        image = image.astype(np.float32)
+        finite = image[np.isfinite(image)]
+        if finite.size == 0:
+            return np.zeros_like(image, dtype=np.float32)
+        lo = float(finite.min())
+        hi = float(finite.max())
+        if hi > lo:
+            image = (image - lo) / (hi - lo)
+        elif hi > 1.0:
+            image = image / 255.0
+        return np.clip(image, 0.0, 1.0).astype(np.float32)
+
     def validate(self, payload: dict):
-        images, joints, masks = (payload["depth"], payload["joints"], payload["mask"])
-        images = [img.astype(np.float32) for img in images]
-        images = [(img - img.min()) / (img.max() - img.min() + 1e-8) for img in images]
-        images = [np.stack([img] * 3, axis=-1).astype(np.float32) for img in images]
-        joints = [np.array(joint).astype(np.float32) for joint in joints]
-        masks = [mask.astype(np.uint8) for mask in masks]
+        if "images" in payload:
+            images_raw = self._as_batch(payload["images"], "images")
+        elif "image" in payload:
+            images_raw = self._as_batch(payload["image"], "image")
+        elif "depth" in payload:
+            images_raw = self._as_batch(payload["depth"], "depth")
+        else:
+            images_raw = self._as_batch(payload["mask"], "mask")
+
+        images = [self._normalize_image(img) for img in images_raw]
+        joints = [np.array(joint).astype(np.float32) for joint in payload["joints"]]
+        masks = [mask.astype(np.uint8) for mask in self._as_batch(payload["mask"], "mask")]
+
+        if not all(mask.ndim == 2 for mask in masks):
+            raise ValueError("Masks must be 2D.")
 
         if not all(mask.dtype == np.uint8 for mask in masks):
             raise ValueError("Masks must be of type np.uint8.")
@@ -45,12 +89,12 @@ class DR:
             raise ValueError("Masks must be in the range [0, 255].")
         if not all(mask.shape[:2] == image.shape[:2] for mask, image in zip(masks, images, strict=False)):
             raise ValueError("Mask and image shapes do not match.")
-        if not all(mask.ndim == 2 for mask in masks):
-            raise ValueError("Masks must be 2D.")
         if not all(image.ndim == 3 for image in images):
             raise ValueError("Images must be 3D.")
         if not all(image.shape[-1] == 3 for image in images):
             raise ValueError("Images must have 3 channels")
+        if len(images) != len(joints) or len(images) != len(masks):
+            raise ValueError(f"Batch mismatch: images={len(images)} joints={len(joints)} masks={len(masks)}")
         return images, joints, masks
 
     def step(self, payload: dict) -> dict:
@@ -59,7 +103,7 @@ class DR:
         extrinsics = payload.get("HT")
         print("extrinsics", extrinsics)
 
-        _b, h, w = payload["depth"].shape
+        h, w = masks[0].shape[:2]
         if self.r is None:
             self.r = Renderer(
                 self.hcfg,
@@ -139,7 +183,7 @@ class DR:
             render = render.cpu().numpy()
 
             im = images[i]  # im = np.stack([images[i]]*3, axis=-1).astype(np.uint8)
-            im = (im - im.min()) / (im.max() - im.min()) * 255.0
+            im = (im - im.min()) / (im.max() - im.min() + 1e-8) * 255.0
             im = im.astype(np.uint8)
 
             rmask = (render * 255.0).astype(np.uint8)
