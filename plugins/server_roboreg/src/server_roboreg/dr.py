@@ -190,12 +190,25 @@ class DR:
         optimize_root_transform = bool(payload.get("ht_is_root", False))
         root_transform = extrinsics if optimize_cv_w2c or optimize_root_transform else torch.linalg.inv(extrinsics)
         intr = torch.tensor(payload["intrinsics"], dtype=torch.float32, device=self.device)
+        # force fxy to become 515
+        fxy = 515
+        # intr[0][0] = intr[1][1] = fxy
+        print(intr)
+        print(joints.shape)
+
+        print(intr)
 
         # enable gradient tracking and instantiate optimizer
         root_transform_9d = pk.matrix44_to_se3_9d(root_transform)
         root_transform_9d.requires_grad = True
+        intr.requires_grad = True
+
         optimizer = getattr(importlib.import_module("torch.optim"), self.cfg.optimizer)(
-            [root_transform_9d], lr=self.cfg.lr
+            [  # params to optimize
+                root_transform_9d,
+                intr,
+            ],
+            lr=self.cfg.lr,
         )
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=self.cfg.step_size, gamma=self.cfg.gamma)
         best_extrinsics = extrinsics
@@ -215,14 +228,31 @@ class DR:
                 renders = {
                     "camera": self.r.scene.observe_from("camera"),
                 }
+
+            ### @mhyatt000 print block
+            # print(f"targets={targets.mean(), targets.shape}")
+            _r = renders["camera"]
+            # print(f"renders={_r.mean(), _r.shape}")
+            # print(targets.min(), targets.max(), _r.min(), _r.max())
+            tobin = lambda x: x > 0.5
+            inter, union = (
+                torch.logical_and(tobin(targets), tobin(_r)).sum(),
+                torch.logical_or(tobin(targets), tobin(_r)).sum(),
+            )
+            iou = inter / union
+            print(f"iou={iou}")
+            print(intr.detach().cpu())
+            ### @mhyatt000 end print block
+
             if self.cfg.mode == REGISTRATION_MODE.DISTANCE_FUNCTION:
                 loss = torch.nn.functional.mse_loss(targets, renders["camera"])
             elif self.cfg.mode == REGISTRATION_MODE.SEGMENTATION:
                 loss = soft_dice_loss(targets, renders["camera"]).mean()
             else:
                 raise ValueError("Invalid registration mode.")
-            print("targets", targets.sum(), targets.mean())
-            print("renders", renders["camera"].sum(), renders["camera"].mean())
+            # print("targets", targets.sum(), targets.mean())
+            # print("renders", renders["camera"].sum(), renders["camera"].mean())
+
             if iteration == 1 or iteration == self.cfg.max_iterations or iteration % self.cfg.step_size == 0:
                 self._print_batch_stats(iteration, targets, renders["camera"])
 
@@ -239,7 +269,9 @@ class DR:
                 best_loss = loss.item()
                 best_root_transform = root_transform.detach().clone()
                 best_extrinsics = (
-                    best_root_transform if optimize_cv_w2c or optimize_root_transform else torch.linalg.inv(best_root_transform)
+                    best_root_transform
+                    if optimize_cv_w2c or optimize_root_transform
+                    else torch.linalg.inv(best_root_transform)
                 )
 
         # render final results and save extrinsics
@@ -259,10 +291,13 @@ class DR:
             im = im.astype(np.uint8)
 
             rmask = (render * 255.0).astype(np.uint8)
-            print(im.shape, im.dtype, rmask.shape, rmask.dtype)
+            rimg = np.stack([rmask, rmask, rmask], axis=-1)
+            # print(im.shape, im.dtype, rmask.shape, rmask.dtype)
             print(im.min(), im.max(), rmask.min(), rmask.max())
-            print(im.sum(), rmask.sum())
+            print(f"mask mean={rmask.mean() / 255}")
+            # print(im.sum(), rmask.sum())
             overlay = overlay_mask(im, rmask, self.r.color, scale=1.0)
+            rast_overlay = overlay_mask(rimg, masks[i], mode="g", scale=1.0)
             difference = np.abs(render - masks[i].astype(np.float32) / 255.0)
             difference = overlay_mask(
                 im,
@@ -274,6 +309,7 @@ class DR:
             out = {
                 "overlays": overlay,
                 "renders": rmask,
+                "render_overlays": rast_overlay,
                 # 'difference': (difference* 255.0).astype(np.uint8),
                 "difference": difference,
             }

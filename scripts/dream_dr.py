@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 import importlib.util
 import json
@@ -19,6 +19,7 @@ from webpolicy.client import Client
 @dataclass
 class Config:
     data_dir: Path = Path("~/rr_good")  # Directory containing record_data.py npz files
+    data_select: list[int] = field(default_factory=lambda: [-1])  # select records idx or -1 for all
     output_dir: Path | None = None  # Run output directory. Defaults under data_dir.
     image_size: int = 200  # Square size for SAM, Dream, and DR
     max_records: int | None = None  # Optional cap for quick tests
@@ -45,7 +46,7 @@ class Config:
     dr_lr: float = 3e-3  # DR optimizer learning rate
     dr_max_iterations: int = 1000  # DR optimization iterations
     dr_step_size: int = 100  # LR scheduler step size
-    dr_gamma: float = 1.0  # LR scheduler gamma
+    dr_gamma: float = 0.8  # LR scheduler gamma
     dr_mode: Literal["distance-function", "segmentation"] = "segmentation"  # DR loss target
 
     seed_search: bool = False  # Coarse-search an initial pose with the collected SAM masks before DR
@@ -156,6 +157,10 @@ def model_image(data: dict[str, np.ndarray], size: int) -> tuple[np.ndarray, np.
 
 def load_records(cfg: Config) -> list[Record]:
     paths = sorted(cfg.data_dir.glob("*.npz"))
+    # paths = [paths[i] for i in cfg.data_select] if isinstance(cfg.data_select, list) else paths
+    paths = [paths[i] for i in cfg.data_select if paths != [-1]]
+    print(paths)
+    print(len(paths))
     if cfg.max_records is not None:
         paths = paths[: cfg.max_records]
     if not paths:
@@ -275,7 +280,7 @@ def collect_sam_masks(cfg: Config, records: list[Record]) -> np.ndarray:
         )
         for record in missing:
             logging.info("Requesting SAM mask for %s", record.stem)
-            out = client.step(
+            arm_out = client.step(
                 {
                     "type": "image",
                     "image": record.image,
@@ -283,8 +288,25 @@ def collect_sam_masks(cfg: Config, records: list[Record]) -> np.ndarray:
                     "confidence": cfg.sam_confidence,
                 }
             )
-            mask = mask_from_sam(out, record.image.shape[:2])
-            write_image(mask_dir / f"{record.stem}_mask.png", mask)
+            gripper_out = client.step(
+                {
+                    "type": "image",
+                    "image": record.image,
+                    "text": "end effector",
+                    "confidence": 0.3,
+                }
+            )
+            arm_mask = mask_from_sam(arm_out, record.image.shape[:2])
+            gripper_mask = mask_from_sam(gripper_out, record.image.shape[:2])
+            binarize = lambda arr: (arr / 255) > 0.5
+            arm_mask, gripper_mask = binarize(arm_mask), binarize(gripper_mask)
+            tocv2 = lambda arr: (arr * 255).astype(np.uint8)
+            mask = np.logical_and(arm_mask, np.logical_not(gripper_mask)).astype(np.uint8)
+            print("arm mask min", arm_mask.min(), "arm mask max", arm_mask.max())
+            print("gripper mask min", gripper_mask.min(), "gripper mask max", gripper_mask.max())
+            write_image(mask_dir / f"{record.stem}_mask.png", tocv2(mask))
+            write_image(mask_dir / f"{record.stem}_grippermask.png", tocv2(gripper_mask))
+            write_image(mask_dir / f"{record.stem}_arm-mask.png", tocv2(arm_mask))
 
     if missing:
         return collect_sam_masks(Config(**(asdict(cfg) | {"refresh_cache": False})), records)
@@ -425,7 +447,9 @@ def score_record_w2c(
     joints = torch.tensor(np.stack([record.joints for record in records]), dtype=torch.float32, device=renderer.device)
     mask_bin = masks > 0
     intr = torch.tensor(
-        scaled_intrinsics(np.stack([record.intrinsics for record in records]).astype(np.float32)[0], cfg.intrinsics_scale),
+        scaled_intrinsics(
+            np.stack([record.intrinsics for record in records]).astype(np.float32)[0], cfg.intrinsics_scale
+        ),
         dtype=torch.float32,
         device=renderer.device,
     )
@@ -444,10 +468,17 @@ def score_record_w2c(
             masks[0].shape[0],
             masks[0].shape[1],
         )
-        render_bin = render.detach().cpu().numpy()[..., 0] > 0.5
+        # render: torch size B,W,H,C=1
+        render_bin = render.detach().cpu().numpy()[..., 0] > 0.5  # np B,W,H
+        print(type(render_bin))
+        print("render bin shape", render_bin.shape)
         intersection = np.logical_and(render_bin, mask_bin).sum()
         union = np.logical_or(render_bin, mask_bin).sum()
         render_area = render_bin.sum()
+        print("render bin shape", render_bin.shape)
+        print(intersection, union)
+        print("iou", intersection / union)
+        print("render bin mean", render_bin.mean())
         mask_area = mask_bin.sum()
         area_ratio = render_area / float(mask_area) if mask_area > 0 else 0.0
         area_penalty = min(area_ratio, 1.0 / area_ratio) if area_ratio > 0.0 else 0.0
@@ -732,7 +763,7 @@ def save_outputs(cfg: Config, records: list[Record], masks: np.ndarray, initial:
         np.save(cfg.output_dir / "HT_dream.npy", np.asarray(initial["w2c"], dtype=np.float32))
     if dr_out is not None:
         np.save(cfg.output_dir / "HT_dr.npy", np.asarray(dr_out["HT"], dtype=np.float32))
-        for key in ("overlays", "difference", "renders"):
+        for key in ("overlays", "difference", "renders", "render_overlays"):
             if key not in dr_out:
                 continue
             for record, image in zip(records, np.asarray(dr_out[key]), strict=True):
@@ -811,6 +842,7 @@ def main(cfg: Config) -> None:
         ht = search_seed_pose(cfg, records, masks, ht)
 
     dr_out = run_dr(cfg, records, masks, ht) if cfg.run_dr else None
+    print(dr_out)
     save_outputs(cfg, records, masks, initial, dr_out)
     logging.info("Wrote outputs to %s", cfg.output_dir)
 
