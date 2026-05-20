@@ -31,24 +31,42 @@ class Config:
 
 def open_arm(robot_ip: str | None):
     if robot_ip is None:
+        logging.warning("No --robot-ip set; using fallback --q values for recorded joints.")
         return None
 
     from xarm.wrapper import XArmAPI
 
     arm = XArmAPI(robot_ip, is_radian=True)
-    arm.connect()
-    arm.motion_enable(True)
+    ret = arm.connect()
+    if ret not in (None, 0):
+        raise RuntimeError(f"Failed to connect to xArm at {robot_ip}: ret={ret}")
+    logging.info("Connected to xArm at %s", robot_ip)
     return arm
 
 
 def read_joints(arm, cfg: Config) -> np.ndarray:
-    if arm is not None:
-        return np.asarray(arm.angles, dtype=np.float32).reshape(-1)
-    else:
-        raise FileNotFoundError
+    if arm is None:
+        q = np.asarray(cfg.q, dtype=np.float32).reshape(-1)
+        q = np.deg2rad(q).astype(np.float32) if cfg.deg2rad else q
+        return validate_joints(q)
 
-    q = np.asarray(cfg.q, dtype=np.float32)
-    return np.deg2rad(q).astype(np.float32) if cfg.deg2rad else q
+    ret, angles = arm.get_servo_angle(is_radian=True, is_real=True)
+    if ret != 0:
+        raise RuntimeError(f"Failed to read live xArm joint angles: ret={ret}")
+    return validate_joints(np.asarray(angles, dtype=np.float32).reshape(-1))
+
+
+def validate_joints(q: np.ndarray) -> np.ndarray:
+    if q.size < 7:
+        raise ValueError(f"Expected at least 7 joint angles, got {q.size}: {q}")
+    q = q[:7].astype(np.float32, copy=False)
+    if not np.isfinite(q).all():
+        raise ValueError(f"Joint angles contain non-finite values: {q}")
+    return q
+
+
+def dream_joints(q_rad: np.ndarray) -> np.ndarray:
+    return np.rad2deg(validate_joints(q_rad)).astype(np.float32)
 
 
 def camera_source(camera: str | int) -> str | int:
@@ -260,7 +278,6 @@ def save_record(
         cv2.imwrite(str(cfg.save_dir / f"{stem}_raster.png"), raster)
     if mask is not None:
         cv2.imwrite(str(cfg.save_dir / f"{stem}_mask.png"), mask)
-    np.savez(cfg.save_dir / f"{stem}.npz", image=frame, image_model=model_frames, joints=q, K=k, raster=raster, mask=mask)
     if mask_raw is not None:
         cv2.imwrite(str(cfg.save_dir / f"{stem}_mask_raw.png"), mask_raw)
 
@@ -268,6 +285,7 @@ def save_record(
         "image": frame,
         "image_model": model_frames,
         "joints": q,
+        "joints_is_radian": np.array(True),
         "K": k,
     }
     if raster is not None:
@@ -311,7 +329,7 @@ def main(cfg: Config) -> None:
             model_frames = np.stack([model_frame], axis=0)
             q = read_joints(arm, cfg)
             k = intrinsics(frame.shape[1], frame.shape[0], cfg)
-            out = client.step({"image": model_frames, "type": "image", "q": q, "K": k})
+            out = client.step({"image": model_frames, "type": "image", "q": dream_joints(q), "K": k})
             logging.info("Dream response shapes=%s", response_shapes(out))
             logging.info("Dream response stats=%s", response_stats(out))
             raster = dream_raster(out)
