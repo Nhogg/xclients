@@ -99,11 +99,12 @@ class DR:
         projection = self._opencv_projection(intr, width, height)
         mvp = projection @ (flip @ w2c)
         observed_vertices = torch.matmul(self.r.scene.robot.configured_vertices, mvp.transpose(-1, -2))
-        return self.r.scene.renderer.constant_color(
+        render = self.r.scene.renderer.constant_color(
             observed_vertices,
             self.r.scene.robot.faces,
             self.r.scene.cameras[self.r.camera_name].resolution,
         )
+        return torch.flip(render, dims=[1])
 
     @staticmethod
     def _print_batch_stats(iteration: int, targets: torch.Tensor, renders: torch.Tensor) -> None:

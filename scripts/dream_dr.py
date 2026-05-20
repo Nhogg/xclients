@@ -46,7 +46,7 @@ class Config:
     dr_max_iterations: int = 1000  # DR optimization iterations
     dr_step_size: int = 100  # LR scheduler step size
     dr_gamma: float = 1.0  # LR scheduler gamma
-    dr_mode: Literal["distance-function", "segmentation"] = "distance-function"  # DR loss target
+    dr_mode: Literal["distance-function", "segmentation"] = "segmentation"  # DR loss target
 
     seed_search: bool = False  # Coarse-search an initial pose with the collected SAM masks before DR
     seed_search_base_w2c_index: int = 2  # Record w2c used as seed-search center
@@ -62,6 +62,9 @@ class Config:
     seed_search_min_area_ratio: float = 0.3  # Reject per-frame renders smaller than this fraction of mask area
     seed_search_max_area_ratio: float = 2.0  # Reject per-frame renders larger than this many mask areas
     seed_search_min_hit_frames: int = 3  # Reject candidates with fewer useful frames
+    w2c_translation_scale: float = 1.0  # Scale selected initial w2c translation; <1 moves robot closer
+    w2c_z_scale: float = 1.0  # Scale only selected initial w2c camera-z translation; <1 moves robot closer
+    intrinsics_scale: float = 1.0  # Scale fx/fy during DR rendering; >1 makes render larger
 
     ros_package: str = "xarm_description"  # Robot description package for roboreg
     xacro_path: str = "urdf/xarm_device.urdf.xacro"  # Xacro path relative to ros_package
@@ -343,13 +346,27 @@ def collect_initial_pose(cfg: Config, records: list[Record], masks: np.ndarray) 
         ht = load_first_array(cfg.extrinsics_path, ("w2c", "HT", "extrinsics"))
         if ht is None:
             raise ValueError(f"No w2c/HT/extrinsics found in {cfg.extrinsics_path}")
-        return {"w2c": ht, "pose_source": np.asarray(str(cfg.extrinsics_path))}
+        return {"w2c": apply_w2c_adjustments(cfg, ht), "pose_source": np.asarray(str(cfg.extrinsics_path))}
 
     record, w2c = select_record_w2c(cfg, records, masks)
     if w2c is not None:
         logging.info("Using static initial w2c from record %s", record.path)
         return {"w2c": w2c, "pose_source": np.asarray(str(record.path))}
     raise ValueError("No record has w2c. Pass --extrinsics-path or use --call-dream to get initial extrinsics.")
+
+
+def apply_initial_pose_scale(ht: np.ndarray, translation_scale: float) -> np.ndarray:
+    out = np.asarray(ht, dtype=np.float32).copy()
+    if translation_scale != 1.0:
+        out[..., :3, 3] *= translation_scale
+    return out
+
+
+def apply_w2c_adjustments(cfg: Config, ht: np.ndarray) -> np.ndarray:
+    out = apply_initial_pose_scale(ht, cfg.w2c_translation_scale)
+    if cfg.w2c_z_scale != 1.0:
+        out[..., 2, 3] *= cfg.w2c_z_scale
+    return out
 
 
 def select_record_w2c(cfg: Config, records: list[Record], masks: np.ndarray) -> tuple[Record, np.ndarray | None]:
@@ -363,11 +380,11 @@ def select_record_w2c(cfg: Config, records: list[Record], masks: np.ndarray) -> 
         record = records[cfg.record_w2c_index]
         if record.w2c is None:
             raise ValueError(f"Record {record.path} has no w2c")
-        return record, record.w2c
+        return record, apply_w2c_adjustments(cfg, record.w2c)
 
     if len(candidates) == 1:
         _, record, w2c = candidates[0]
-        return record, w2c
+        return record, apply_w2c_adjustments(cfg, w2c)
 
     try:
         return score_record_w2c(cfg, records, masks, candidates)
@@ -408,7 +425,7 @@ def score_record_w2c(
     joints = torch.tensor(np.stack([record.joints for record in records]), dtype=torch.float32, device=renderer.device)
     mask_bin = masks > 0
     intr = torch.tensor(
-        np.stack([record.intrinsics for record in records]).astype(np.float32)[0],
+        scaled_intrinsics(np.stack([record.intrinsics for record in records]).astype(np.float32)[0], cfg.intrinsics_scale),
         dtype=torch.float32,
         device=renderer.device,
     )
@@ -417,7 +434,8 @@ def score_record_w2c(
     best_record = candidates[0][1]
     best_w2c = candidates[0][2]
     for index, record, w2c in candidates:
-        ht = np.repeat(w2c[None], len(records), axis=0)
+        adjusted_w2c = apply_w2c_adjustments(cfg, w2c)
+        ht = np.repeat(adjusted_w2c[None], len(records), axis=0)
         render = render_cv_w2c(
             renderer,
             joints,
@@ -447,7 +465,7 @@ def score_record_w2c(
         if score > best_score or (score == best_score and render_area > 0):
             best_score = score
             best_record = record
-            best_w2c = w2c
+            best_w2c = adjusted_w2c
     return best_record, best_w2c
 
 
@@ -480,11 +498,12 @@ def render_cv_w2c(
     flip = torch.diag(torch.tensor([1.0, -1.0, -1.0, 1.0], dtype=w2c.dtype, device=w2c.device))
     mvp = opencv_projection(intr, width, height) @ (flip @ w2c)
     observed_vertices = torch.matmul(renderer.scene.robot.configured_vertices, mvp.transpose(-1, -2))
-    return renderer.scene.renderer.constant_color(
+    render = renderer.scene.renderer.constant_color(
         observed_vertices,
         renderer.scene.robot.faces,
         renderer.scene.cameras[renderer.camera_name].resolution,
     )
+    return torch.flip(render, dims=[1])
 
 
 def assert_dream_pose(out: dict, n: int) -> np.ndarray:
@@ -689,11 +708,21 @@ def run_dr(cfg: Config, records: list[Record], masks: np.ndarray, ht: np.ndarray
         "images": np.stack([record.image for record in records]).astype(np.uint8),
         "joints": np.stack([record.joints for record in records]).astype(np.float32),
         "mask": masks.astype(np.uint8),
-        "intrinsics": np.stack([record.intrinsics for record in records]).astype(np.float32)[0],
+        "intrinsics": scaled_intrinsics(
+            np.stack([record.intrinsics for record in records]).astype(np.float32)[0],
+            cfg.intrinsics_scale,
+        ),
         "HT": ht.astype(np.float32),
         "ht_is_cv_w2c": True,
     }
     return DR(hcfg.dr, hcfg).step(payload)
+
+
+def scaled_intrinsics(k: np.ndarray, scale: float) -> np.ndarray:
+    out = np.asarray(k, dtype=np.float32).copy()
+    out[0, 0] *= scale
+    out[1, 1] *= scale
+    return out
 
 
 def save_outputs(cfg: Config, records: list[Record], masks: np.ndarray, initial: dict, dr_out: dict | None) -> None:
