@@ -23,7 +23,6 @@ class RendererConfig:
     color: str = "b"
     max_jobs: int = 2
     batch_size: int = 1
-    logging: bool = True
 
 
 class Renderer:
@@ -48,15 +47,14 @@ class Renderer:
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         os.environ["MAX_JOBS"] = str(self.rcfg.max_jobs)
-        if self.rcfg.logging:
-            logging.info(
-                "Initializing Renderer device=%s batch_size=%d resolution=(%d, %d) urdf=%s",
-                self.device,
-                self.rcfg.batch_size,
-                height,
-                width,
-                cfg.urdf or None,
-            )
+        logging.info(
+            "Initializing Renderer device=%s batch_size=%d resolution=(%d, %d) urdf=%s",
+            self.device,
+            self.rcfg.batch_size,
+            height,
+            width,
+            cfg.urdf or None,
+        )
 
         camera = {
             "camera": VirtualCamera(
@@ -68,8 +66,7 @@ class Renderer:
         }
 
         if cfg.urdf:
-            if self.rcfg.logging:
-                logging.info("Creating robot scene from local URDF: %s", cfg.urdf)
+            logging.info("Creating robot scene from local URDF: %s", cfg.urdf)
             self.scene = create_robot_scene_from_urdf(
                 batch_size=rcfg.batch_size,
                 urdf_path=cfg.urdf,
@@ -80,8 +77,7 @@ class Renderer:
                 collision=cfg.collision_meshes,
             )
         else:
-            if self.rcfg.logging:
-                logging.info("Creating robot scene from ROS package=%s xacro=%s", cfg.ros_package, cfg.xacro_path)
+            logging.info("Creating robot scene from ROS package=%s xacro=%s", cfg.ros_package, cfg.xacro_path)
             self.scene = create_robot_scene(
                 batch_size=rcfg.batch_size,
                 ros_package=cfg.ros_package,
@@ -147,22 +143,20 @@ class Renderer:
         if joints.ndim == 1:
             joints = joints.unsqueeze(0)
 
-        if self.rcfg.logging:
-            logging.info("Renderer.step images_shape=%s joints_shape=%s", images_np.shape, tuple(joints.shape))
+        logging.info("Renderer.step images_shape=%s joints_shape=%s", images_np.shape, tuple(joints.shape))
 
         overlays: list[np.ndarray] = []
         for index, (j, im) in enumerate(tqdm(zip(joints, images_np, strict=False))):
             self.scene.robot.configure(j.reshape(1, -1))
             renders = self.scene.observe_from(self.camera_name)
             render_masks = (renders * 255.0).squeeze(-1).cpu().numpy().astype(np.uint8)
-            if self.rcfg.logging:
-                logging.info(
-                    "Renderer.step sample=%d image_shape=%s render_shape=%s render_mean=%.6f",
-                    index,
-                    im.shape,
-                    render_masks.shape,
-                    float(render_masks.mean() / 255.0),
-                )
+            logging.info(
+                "Renderer.step sample=%d image_shape=%s render_shape=%s render_mean=%.6f",
+                index,
+                im.shape,
+                render_masks.shape,
+                float(render_masks.mean() / 255.0),
+            )
 
             overlays.append(overlay_mask(im, render_masks[0], self.color, scale=1.0))
 

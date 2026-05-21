@@ -17,6 +17,45 @@ from server_roboreg.common import DRConfig, HydraConfig, REGISTRATION_MODE
 from server_roboreg.render import Renderer, RendererConfig
 
 
+def opencv_projection(intr: torch.Tensor, width: int, height: int) -> torch.Tensor:
+    if intr.ndim == 2:
+        projection = torch.zeros(4, 4, dtype=intr.dtype, device=intr.device)
+    elif intr.ndim == 3:
+        projection = torch.zeros((intr.shape[0], 4, 4), dtype=intr.dtype, device=intr.device)
+    else:
+        raise ValueError(f"Expected intrinsics with shape (3, 3) or (B, 3, 3), got {tuple(intr.shape)}")
+
+    znear, zfar = 0.01, 10.0
+    projection[..., 0, 0] = 2.0 * intr[..., 0, 0] / width
+    projection[..., 1, 1] = 2.0 * intr[..., 1, 1] / height
+    projection[..., 0, 2] = 1.0 - 2.0 * intr[..., 0, 2] / width
+    projection[..., 1, 2] = 2.0 * intr[..., 1, 2] / height - 1.0
+    projection[..., 2, 2] = -(zfar + znear) / (zfar - znear)
+    projection[..., 2, 3] = -2.0 * zfar * znear / (zfar - znear)
+    projection[..., 3, 2] = -1.0
+    return projection
+
+
+def render_cv_w2c(
+    renderer: Renderer,
+    joints: torch.Tensor,
+    w2c: torch.Tensor,
+    intr: torch.Tensor,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    renderer.scene.robot.configure(joints)
+    flip = torch.diag(torch.tensor([1.0, -1.0, -1.0, 1.0], dtype=w2c.dtype, device=w2c.device))
+    mvp = opencv_projection(intr, width, height) @ (flip @ w2c)
+    observed_vertices = torch.matmul(renderer.scene.robot.configured_vertices, mvp.transpose(-1, -2))
+    render = renderer.scene.renderer.constant_color(
+        observed_vertices,
+        renderer.scene.robot.faces,
+        renderer.scene.cameras[renderer.camera_name].resolution,
+    )
+    return torch.flip(render, dims=[1])
+
+
 class DR:
     def __init__(self, cfg: DRConfig, hcfg: HydraConfig):
         self.cfg, self.hcfg = cfg, hcfg
@@ -29,8 +68,7 @@ class DR:
         self.r = None
 
     def log_info(self, msg: str, *args: object) -> None:
-        if self.cfg.logging:
-            logging.info(msg, *args)
+        logging.info(msg, *args)
 
     @staticmethod
     def _as_batch(value: object, name: str) -> np.ndarray:
@@ -76,22 +114,7 @@ class DR:
         return target
 
     def _opencv_projection(self, intr: torch.Tensor, width: int, height: int) -> torch.Tensor:
-        if intr.ndim == 2:
-            projection = torch.zeros(4, 4, dtype=intr.dtype, device=intr.device)
-        elif intr.ndim == 3:
-            projection = torch.zeros((intr.shape[0], 4, 4), dtype=intr.dtype, device=intr.device)
-        else:
-            raise ValueError(f"Expected intrinsics with shape (3, 3) or (B, 3, 3), got {tuple(intr.shape)}")
-
-        znear, zfar = 0.01, 10.0
-        projection[..., 0, 0] = 2.0 * intr[..., 0, 0] / width
-        projection[..., 1, 1] = 2.0 * intr[..., 1, 1] / height
-        projection[..., 0, 2] = 1.0 - 2.0 * intr[..., 0, 2] / width
-        projection[..., 1, 2] = 2.0 * intr[..., 1, 2] / height - 1.0
-        projection[..., 2, 2] = -(zfar + znear) / (zfar - znear)
-        projection[..., 2, 3] = -2.0 * zfar * znear / (zfar - znear)
-        projection[..., 3, 2] = -1.0
-        return projection
+        return opencv_projection(intr, width, height)
 
     def _render_cv_w2c(
         self,
@@ -101,17 +124,7 @@ class DR:
         height: int,
         width: int,
     ) -> torch.Tensor:
-        self.r.scene.robot.configure(joints)
-        flip = torch.diag(torch.tensor([1.0, -1.0, -1.0, 1.0], dtype=w2c.dtype, device=w2c.device))
-        projection = self._opencv_projection(intr, width, height)
-        mvp = projection @ (flip @ w2c)
-        observed_vertices = torch.matmul(self.r.scene.robot.configured_vertices, mvp.transpose(-1, -2))
-        render = self.r.scene.renderer.constant_color(
-            observed_vertices,
-            self.r.scene.robot.faces,
-            self.r.scene.cameras[self.r.camera_name].resolution,
-        )
-        return torch.flip(render, dims=[1])
+        return render_cv_w2c(self.r, joints, w2c, intr, height, width)
 
     @staticmethod
     def _print_batch_stats(iteration: int, targets: torch.Tensor, renders: torch.Tensor) -> None:
@@ -131,8 +144,6 @@ class DR:
             )
 
     def _log_batch_stats(self, iteration: int, targets: torch.Tensor, renders: torch.Tensor) -> None:
-        if not self.cfg.logging:
-            return
         target = targets.detach().squeeze(-1)
         render = renders.detach().squeeze(-1)
         target_bin = target > 0.0
@@ -204,7 +215,6 @@ class DR:
                 self.hcfg,
                 RendererConfig(
                     batch_size=len(joints),
-                    logging=self.cfg.logging,
                 ),
                 intr=payload["intrinsics"],
                 # no extrinsics provided, initialize with identity
@@ -264,10 +274,7 @@ class DR:
         best_intr = intr.detach().clone()
         best_loss = float("inf")
 
-        iterations = range(1, self.cfg.max_iterations + 1)
-        if self.cfg.display_progress:
-            iterations = rich.progress.track(iterations, "Optimizing...")
-        for iteration in iterations:
+        for iteration in rich.progress.track(range(1, self.cfg.max_iterations + 1), "Optimizing..."):
             if not root_transform_9d.requires_grad:
                 raise ValueError("Extrinsics require gradients.")
             if not torch.is_grad_enabled():
@@ -288,11 +295,8 @@ class DR:
             else:
                 raise ValueError("Invalid registration mode.")
 
-            if self.cfg.display_progress and (
-                iteration == 1 or iteration == self.cfg.max_iterations or iteration % self.cfg.step_size == 0
-            ):
-                self._print_batch_stats(iteration, targets, renders["camera"])
             if iteration == 1 or iteration == self.cfg.max_iterations or iteration % self.cfg.step_size == 0:
+                self._print_batch_stats(iteration, targets, renders["camera"])
                 self._log_batch_stats(iteration, targets, renders["camera"])
 
             optimizer.zero_grad()
@@ -301,11 +305,10 @@ class DR:
             scheduler.step()
             lr = scheduler.get_last_lr()[0]
 
-            if self.cfg.display_progress:
-                rich.print(
-                    f"Step [{iteration} / {self.cfg.max_iterations}], loss: {np.round(loss.item(), 3)}, "
-                    f"best loss: {np.round(best_loss, 3)}, lr: {lr}"
-                )
+            rich.print(
+                f"Step [{iteration} / {self.cfg.max_iterations}], loss: {np.round(loss.item(), 3)}, "
+                f"best loss: {np.round(best_loss, 3)}, lr: {lr}"
+            )
             self.log_info(
                 "DR step=%d/%d loss=%.6f best_loss=%.6f lr=%.6g",
                 iteration,

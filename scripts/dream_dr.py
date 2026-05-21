@@ -48,7 +48,6 @@ class Config:
     dr_step_size: int = 100  # LR scheduler step size
     dr_gamma: float = 0.8  # LR scheduler gamma
     dr_mode: Literal["distance-function", "segmentation"] = "segmentation"  # DR loss target
-    logging: bool = True  # Enable verbose server_roboreg DR logging
 
     ros_package: str = "xarm_description"  # Robot description package for roboreg
     xacro_path: str = "urdf/xarm_device.urdf.xacro"  # Xacro path relative to ros_package
@@ -391,6 +390,7 @@ def score_record_w2c(
     ensure_plugin_src()
 
     from server_roboreg.common import HydraConfig
+    from server_roboreg.dr import render_cv_w2c
     from server_roboreg.render import Renderer, RendererConfig
 
     bundled_urdf = Path(__file__).resolve().parents[1] / "plugins/server_roboreg/xarm7_standalone.urdf"
@@ -433,15 +433,9 @@ def score_record_w2c(
         )
         # render: torch size B,W,H,C=1
         render_bin = render.detach().cpu().numpy()[..., 0] > 0.5  # np B,W,H
-        print(type(render_bin))
-        print("render bin shape", render_bin.shape)
         intersection = np.logical_and(render_bin, mask_bin).sum()
         union = np.logical_or(render_bin, mask_bin).sum()
         render_area = render_bin.sum()
-        print("render bin shape", render_bin.shape)
-        print(intersection, union)
-        print("iou", intersection / union)
-        print("render bin mean", render_bin.mean())
         mask_area = mask_bin.sum()
         area_ratio = render_area / float(mask_area) if mask_area > 0 else 0.0
         area_penalty = min(area_ratio, 1.0 / area_ratio) if area_ratio > 0.0 else 0.0
@@ -461,41 +455,6 @@ def score_record_w2c(
             best_record = record
             best_w2c = adjusted_w2c
     return best_record, best_w2c
-
-
-def opencv_projection(intr: torch.Tensor, width: int, height: int) -> torch.Tensor:
-
-    projection = torch.zeros(4, 4, dtype=intr.dtype, device=intr.device)
-    znear, zfar = 0.01, 10.0
-    projection[0, 0] = 2.0 * intr[0, 0] / width
-    projection[1, 1] = 2.0 * intr[1, 1] / height
-    projection[0, 2] = 1.0 - 2.0 * intr[0, 2] / width
-    projection[1, 2] = 2.0 * intr[1, 2] / height - 1.0
-    projection[2, 2] = -(zfar + znear) / (zfar - znear)
-    projection[2, 3] = -2.0 * zfar * znear / (zfar - znear)
-    projection[3, 2] = -1.0
-    return projection
-
-
-def render_cv_w2c(
-    renderer,
-    joints: torch.Tensor,
-    w2c: torch.Tensor,
-    intr: torch.Tensor,
-    height: int,
-    width: int,
-) -> torch.Tensor:
-
-    renderer.scene.robot.configure(joints)
-    flip = torch.diag(torch.tensor([1.0, -1.0, -1.0, 1.0], dtype=w2c.dtype, device=w2c.device))
-    mvp = opencv_projection(intr, width, height) @ (flip @ w2c)
-    observed_vertices = torch.matmul(renderer.scene.robot.configured_vertices, mvp.transpose(-1, -2))
-    render = renderer.scene.renderer.constant_color(
-        observed_vertices,
-        renderer.scene.robot.faces,
-        renderer.scene.cameras[renderer.camera_name].resolution,
-    )
-    return torch.flip(render, dims=[1])
 
 
 def assert_dream_pose(out: dict, n: int) -> np.ndarray:
@@ -544,8 +503,6 @@ def run_dr(cfg: Config, records: list[Record], masks: np.ndarray, ht: np.ndarray
         step_size=cfg.dr_step_size,
         gamma=cfg.dr_gamma,
         mode=REGISTRATION_MODE(cfg.dr_mode),
-        display_progress=cfg.logging,
-        logging=cfg.logging,
     )
 
     payload = {
