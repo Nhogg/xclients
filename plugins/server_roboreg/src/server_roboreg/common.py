@@ -30,6 +30,8 @@ class DRConfig:
 
     mode: REGISTRATION_MODE = REGISTRATION_MODE.DISTANCE_FUNCTION
     display_progress: bool = False
+    logging: bool = True
+    optimize_intrinsics: bool = False
 
     ros_package: str = "xarm_description"
     xacro_path: str = "urdf/xarm_device.urdf.xacro"

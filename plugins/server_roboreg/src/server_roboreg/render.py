@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import os
 from pathlib import Path
 
@@ -22,6 +23,7 @@ class RendererConfig:
     color: str = "b"
     max_jobs: int = 2
     batch_size: int = 1
+    logging: bool = True
 
 
 class Renderer:
@@ -46,6 +48,15 @@ class Renderer:
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         os.environ["MAX_JOBS"] = str(self.rcfg.max_jobs)
+        if self.rcfg.logging:
+            logging.info(
+                "Initializing Renderer device=%s batch_size=%d resolution=(%d, %d) urdf=%s",
+                self.device,
+                self.rcfg.batch_size,
+                height,
+                width,
+                cfg.urdf or None,
+            )
 
         camera = {
             "camera": VirtualCamera(
@@ -57,6 +68,8 @@ class Renderer:
         }
 
         if cfg.urdf:
+            if self.rcfg.logging:
+                logging.info("Creating robot scene from local URDF: %s", cfg.urdf)
             self.scene = create_robot_scene_from_urdf(
                 batch_size=rcfg.batch_size,
                 urdf_path=cfg.urdf,
@@ -67,6 +80,8 @@ class Renderer:
                 collision=cfg.collision_meshes,
             )
         else:
+            if self.rcfg.logging:
+                logging.info("Creating robot scene from ROS package=%s xacro=%s", cfg.ros_package, cfg.xacro_path)
             self.scene = create_robot_scene(
                 batch_size=rcfg.batch_size,
                 ros_package=cfg.ros_package,
@@ -93,6 +108,19 @@ class Renderer:
             data = np.expand_dims(data, axis=0)
         return data
 
+    @staticmethod
+    def _normalize_depth_images(depth: object) -> np.ndarray:
+        depth_arr = np.asarray(depth, dtype=np.float32)
+        images = np.stack([depth_arr] * 3, axis=-1)
+        finite = images[np.isfinite(images)]
+        if finite.size == 0:
+            return np.zeros_like(images, dtype=np.uint8)
+
+        lo = float(finite.min())
+        hi = float(finite.max())
+        images = (images - lo) / (hi - lo) if hi > lo else np.zeros_like(images, dtype=np.float32)
+        return np.clip(images * 255.0, 0.0, 255.0).astype(np.uint8)
+
     def observe(self) -> torch.Tensor:
         """Render the current scene from the configured camera."""
         renders = self.scene.observe_from(self.camera_name)
@@ -111,30 +139,31 @@ class Renderer:
         images = payload.get("images")
         if images is None:
             images = payload.get("depth")
-            images = np.stack([images] * 3, axis=-1)  # convert depth to 3-channel for overlay
-            # normalize
-            images = (images - images.min()) / (images.max() - images.min()) * 255.0
-            images = images.astype(np.uint8)
+            images = self._normalize_depth_images(images)
         joints = payload["joints"]
-
-        print(payload.keys())
 
         images_np = self._ensure_batch(np.asarray(images))
         joints = torch.as_tensor(joints, dtype=torch.float32, device=self.device)
         if joints.ndim == 1:
             joints = joints.unsqueeze(0)
 
-        print(joints.shape, images_np.shape)
+        if self.rcfg.logging:
+            logging.info("Renderer.step images_shape=%s joints_shape=%s", images_np.shape, tuple(joints.shape))
 
         overlays: list[np.ndarray] = []
-        for j, im in tqdm(zip(joints, images_np, strict=False)):
-            print(j.shape, im.shape)
+        for index, (j, im) in enumerate(tqdm(zip(joints, images_np, strict=False))):
             self.scene.robot.configure(j.reshape(1, -1))
             renders = self.scene.observe_from(self.camera_name)
             render_masks = (renders * 255.0).squeeze(-1).cpu().numpy().astype(np.uint8)
-            print(render_masks.shape)
+            if self.rcfg.logging:
+                logging.info(
+                    "Renderer.step sample=%d image_shape=%s render_shape=%s render_mean=%.6f",
+                    index,
+                    im.shape,
+                    render_masks.shape,
+                    float(render_masks.mean() / 255.0),
+                )
 
-            # for im, render in zip(images_np, render_masks, strict=False):
             overlays.append(overlay_mask(im, render_masks[0], self.color, scale=1.0))
 
         return {"overlays": overlays}

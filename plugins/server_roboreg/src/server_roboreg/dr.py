@@ -1,20 +1,17 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import os
 
-import cv2
 import jax
 import numpy as np
 import pytorch_kinematics as pk
 import rich
-from rich import print
 import rich.progress
 from roboreg.losses import soft_dice_loss
 from roboreg.util import mask_distance_transform, mask_exponential_decay, overlay_mask
-from roboreg.util.factories import create_robot_scene
 import torch
-import tyro
 
 from server_roboreg.common import DRConfig, HydraConfig, REGISTRATION_MODE
 from server_roboreg.render import Renderer, RendererConfig
@@ -30,6 +27,10 @@ class DR:
 
         self.modefn = mask_distance_transform if mode == REGISTRATION_MODE.DISTANCE_FUNCTION else mask_exponential_decay
         self.r = None
+
+    def log_info(self, msg: str, *args: object) -> None:
+        if self.cfg.logging:
+            logging.info(msg, *args)
 
     @staticmethod
     def _as_batch(value: object, name: str) -> np.ndarray:
@@ -75,15 +76,21 @@ class DR:
         return target
 
     def _opencv_projection(self, intr: torch.Tensor, width: int, height: int) -> torch.Tensor:
-        projection = torch.zeros(4, 4, dtype=intr.dtype, device=intr.device)
+        if intr.ndim == 2:
+            projection = torch.zeros(4, 4, dtype=intr.dtype, device=intr.device)
+        elif intr.ndim == 3:
+            projection = torch.zeros((intr.shape[0], 4, 4), dtype=intr.dtype, device=intr.device)
+        else:
+            raise ValueError(f"Expected intrinsics with shape (3, 3) or (B, 3, 3), got {tuple(intr.shape)}")
+
         znear, zfar = 0.01, 10.0
-        projection[0, 0] = 2.0 * intr[0, 0] / width
-        projection[1, 1] = 2.0 * intr[1, 1] / height
-        projection[0, 2] = 1.0 - 2.0 * intr[0, 2] / width
-        projection[1, 2] = 2.0 * intr[1, 2] / height - 1.0
-        projection[2, 2] = -(zfar + znear) / (zfar - znear)
-        projection[2, 3] = -2.0 * zfar * znear / (zfar - znear)
-        projection[3, 2] = -1.0
+        projection[..., 0, 0] = 2.0 * intr[..., 0, 0] / width
+        projection[..., 1, 1] = 2.0 * intr[..., 1, 1] / height
+        projection[..., 0, 2] = 1.0 - 2.0 * intr[..., 0, 2] / width
+        projection[..., 1, 2] = 2.0 * intr[..., 1, 2] / height - 1.0
+        projection[..., 2, 2] = -(zfar + znear) / (zfar - znear)
+        projection[..., 2, 3] = -2.0 * zfar * znear / (zfar - znear)
+        projection[..., 3, 2] = -1.0
         return projection
 
     def _render_cv_w2c(
@@ -123,6 +130,28 @@ class DR:
                 f"render_mean={rm.item():.4f}, mask_iou={miou.item():.4f}"
             )
 
+    def _log_batch_stats(self, iteration: int, targets: torch.Tensor, renders: torch.Tensor) -> None:
+        if not self.cfg.logging:
+            return
+        target = targets.detach().squeeze(-1)
+        render = renders.detach().squeeze(-1)
+        target_bin = target > 0.0
+        render_bin = render > 0.5
+        inter = (target_bin & render_bin).sum(dim=(1, 2)).float()
+        union = (target_bin | render_bin).sum(dim=(1, 2)).float()
+        iou = torch.where(union > 0.0, inter / union, torch.zeros_like(union))
+        target_mean = target.mean(dim=(1, 2))
+        render_mean = render.mean(dim=(1, 2))
+        for i, (tm, rm, miou) in enumerate(zip(target_mean, render_mean, iou, strict=True)):
+            logging.info(
+                "DR step=%d sample=%d target_mean=%.6f render_mean=%.6f mask_iou=%.6f",
+                iteration,
+                i,
+                tm.item(),
+                rm.item(),
+                miou.item(),
+            )
+
     def validate(self, payload: dict):
         if "images" in payload:
             images_raw = self._as_batch(payload["images"], "images")
@@ -158,14 +187,24 @@ class DR:
         images, joints, masks = self.validate(payload)
 
         extrinsics = payload.get("HT")
-        print("extrinsics", extrinsics)
+        if extrinsics is None:
+            raise KeyError("DR payload must include an initial HT transform.")
 
         h, w = masks[0].shape[:2]
+        self.log_info(
+            "DR payload batch=%d image_shape=%s mask_shape=%s joints_shape=%s ht_shape=%s",
+            len(images),
+            images[0].shape,
+            masks[0].shape,
+            np.asarray(payload["joints"]).shape,
+            np.asarray(extrinsics).shape,
+        )
         if self.r is None:
             self.r = Renderer(
                 self.hcfg,
                 RendererConfig(
                     batch_size=len(joints),
+                    logging=self.cfg.logging,
                 ),
                 intr=payload["intrinsics"],
                 # no extrinsics provided, initialize with identity
@@ -190,32 +229,45 @@ class DR:
         optimize_root_transform = bool(payload.get("ht_is_root", False))
         root_transform = extrinsics if optimize_cv_w2c or optimize_root_transform else torch.linalg.inv(extrinsics)
         intr = torch.tensor(payload["intrinsics"], dtype=torch.float32, device=self.device)
-        # force fxy to become 515
-        fxy = 515
-        # intr[0][0] = intr[1][1] = fxy
-        print(intr)
-        print(joints.shape)
-
-        print(intr)
+        if intr.shape[-2:] != (3, 3):
+            raise ValueError(f"Expected intrinsics with shape (3, 3) or (B, 3, 3), got {tuple(intr.shape)}")
+        if intr.ndim == 3 and intr.shape[0] != len(joints):
+            raise ValueError(f"Batched intrinsics count {intr.shape[0]} does not match batch size {len(joints)}")
+        self.log_info(
+            "DR setup mode=%s optimizer=%s lr=%.6g iterations=%d optimize_cv_w2c=%s ht_is_root=%s "
+            "optimize_intrinsics=%s intrinsics=%s",
+            self.cfg.mode.value,
+            self.cfg.optimizer,
+            self.cfg.lr,
+            self.cfg.max_iterations,
+            optimize_cv_w2c,
+            optimize_root_transform,
+            self.cfg.optimize_intrinsics,
+            intr.detach().cpu().numpy(),
+        )
 
         # enable gradient tracking and instantiate optimizer
         root_transform_9d = pk.matrix44_to_se3_9d(root_transform)
         root_transform_9d.requires_grad = True
-        intr.requires_grad = True
+        intr.requires_grad = self.cfg.optimize_intrinsics
 
+        optim_params = [root_transform_9d]
+        if self.cfg.optimize_intrinsics:
+            optim_params.append(intr)
         optimizer = getattr(importlib.import_module("torch.optim"), self.cfg.optimizer)(
-            [  # params to optimize
-                root_transform_9d,
-                intr,
-            ],
+            optim_params,
             lr=self.cfg.lr,
         )
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=self.cfg.step_size, gamma=self.cfg.gamma)
         best_extrinsics = extrinsics
         best_root_transform = root_transform
+        best_intr = intr.detach().clone()
         best_loss = float("inf")
 
-        for iteration in rich.progress.track(range(1, self.cfg.max_iterations + 1), "Optimizing..."):
+        iterations = range(1, self.cfg.max_iterations + 1)
+        if self.cfg.display_progress:
+            iterations = rich.progress.track(iterations, "Optimizing...")
+        for iteration in iterations:
             if not root_transform_9d.requires_grad:
                 raise ValueError("Extrinsics require gradients.")
             if not torch.is_grad_enabled():
@@ -229,45 +281,44 @@ class DR:
                     "camera": self.r.scene.observe_from("camera"),
                 }
 
-            ### @mhyatt000 print block
-            # print(f"targets={targets.mean(), targets.shape}")
-            _r = renders["camera"]
-            # print(f"renders={_r.mean(), _r.shape}")
-            # print(targets.min(), targets.max(), _r.min(), _r.max())
-            tobin = lambda x: x > 0.5
-            inter, union = (
-                torch.logical_and(tobin(targets), tobin(_r)).sum(),
-                torch.logical_or(tobin(targets), tobin(_r)).sum(),
-            )
-            iou = inter / union
-            print(f"iou={iou}")
-            print(intr.detach().cpu())
-            ### @mhyatt000 end print block
-
             if self.cfg.mode == REGISTRATION_MODE.DISTANCE_FUNCTION:
                 loss = torch.nn.functional.mse_loss(targets, renders["camera"])
             elif self.cfg.mode == REGISTRATION_MODE.SEGMENTATION:
                 loss = soft_dice_loss(targets, renders["camera"]).mean()
             else:
                 raise ValueError("Invalid registration mode.")
-            # print("targets", targets.sum(), targets.mean())
-            # print("renders", renders["camera"].sum(), renders["camera"].mean())
 
-            if iteration == 1 or iteration == self.cfg.max_iterations or iteration % self.cfg.step_size == 0:
+            if self.cfg.display_progress and (
+                iteration == 1 or iteration == self.cfg.max_iterations or iteration % self.cfg.step_size == 0
+            ):
                 self._print_batch_stats(iteration, targets, renders["camera"])
+            if iteration == 1 or iteration == self.cfg.max_iterations or iteration % self.cfg.step_size == 0:
+                self._log_batch_stats(iteration, targets, renders["camera"])
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             scheduler.step()
+            lr = scheduler.get_last_lr()[0]
 
-            rich.print(
-                f"Step [{iteration} / {self.cfg.max_iterations}], loss: {np.round(loss.item(), 3)}, best loss: {np.round(best_loss, 3)}, lr: {scheduler.get_last_lr().pop()}"
+            if self.cfg.display_progress:
+                rich.print(
+                    f"Step [{iteration} / {self.cfg.max_iterations}], loss: {np.round(loss.item(), 3)}, "
+                    f"best loss: {np.round(best_loss, 3)}, lr: {lr}"
+                )
+            self.log_info(
+                "DR step=%d/%d loss=%.6f best_loss=%.6f lr=%.6g",
+                iteration,
+                self.cfg.max_iterations,
+                loss.item(),
+                best_loss,
+                lr,
             )
 
             if loss.item() < best_loss:
                 best_loss = loss.item()
                 best_root_transform = root_transform.detach().clone()
+                best_intr = intr.detach().clone()
                 best_extrinsics = (
                     best_root_transform
                     if optimize_cv_w2c or optimize_root_transform
@@ -277,7 +328,7 @@ class DR:
         # render final results and save extrinsics
         with torch.no_grad():
             if optimize_cv_w2c:
-                renders = self._render_cv_w2c(joints, best_root_transform, intr, h, w).squeeze(-1)
+                renders = self._render_cv_w2c(joints, best_root_transform, best_intr, h, w).squeeze(-1)
             else:
                 self.r.scene.robot.configure(joints, best_root_transform)
                 renders = self.r.scene.observe_from("camera").squeeze(-1)
@@ -292,10 +343,15 @@ class DR:
 
             rmask = (render * 255.0).astype(np.uint8)
             rimg = np.stack([rmask, rmask, rmask], axis=-1)
-            # print(im.shape, im.dtype, rmask.shape, rmask.dtype)
-            print(im.min(), im.max(), rmask.min(), rmask.max())
-            print(f"mask mean={rmask.mean() / 255}")
-            # print(im.sum(), rmask.sum())
+            self.log_info(
+                "DR output sample=%d image_minmax=(%d,%d) render_minmax=(%d,%d) mask_mean=%.6f",
+                i,
+                int(im.min()),
+                int(im.max()),
+                int(rmask.min()),
+                int(rmask.max()),
+                float(rmask.mean() / 255.0),
+            )
             overlay = overlay_mask(im, rmask, self.r.color, scale=1.0)
             rast_overlay = overlay_mask(rimg, masks[i], mode="g", scale=1.0)
             difference = np.abs(render - masks[i].astype(np.float32) / 255.0)
@@ -317,6 +373,7 @@ class DR:
 
         outs = jax.tree.map(lambda *x: np.stack(x), *outs)
         outs = outs | {"HT": best_extrinsics.cpu().numpy()}
+        self.log_info("DR complete best_loss=%.6f HT=%s", best_loss, outs["HT"])
         return outs
 
 

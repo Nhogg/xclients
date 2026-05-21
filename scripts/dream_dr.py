@@ -48,6 +48,7 @@ class Config:
     dr_step_size: int = 100  # LR scheduler step size
     dr_gamma: float = 0.8  # LR scheduler gamma
     dr_mode: Literal["distance-function", "segmentation"] = "segmentation"  # DR loss target
+    logging: bool = True  # Enable verbose server_roboreg DR logging
 
     ros_package: str = "xarm_description"  # Robot description package for roboreg
     xacro_path: str = "urdf/xarm_device.urdf.xacro"  # Xacro path relative to ros_package
@@ -543,6 +544,8 @@ def run_dr(cfg: Config, records: list[Record], masks: np.ndarray, ht: np.ndarray
         step_size=cfg.dr_step_size,
         gamma=cfg.dr_gamma,
         mode=REGISTRATION_MODE(cfg.dr_mode),
+        display_progress=cfg.logging,
+        logging=cfg.logging,
     )
 
     payload = {
