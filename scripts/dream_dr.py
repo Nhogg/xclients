@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-import importlib.util
 import json
 import logging
 from pathlib import Path
@@ -11,6 +10,10 @@ from typing import Literal
 
 import cv2
 import numpy as np
+from server_roboreg.common import DRConfig, HydraConfig, REGISTRATION_MODE
+from server_roboreg.dr import DR
+from server_roboreg.render import Renderer, RendererConfig
+import torch
 import tyro
 import webpolicy.client as webpolicy_client
 from webpolicy.client import Client
@@ -48,24 +51,6 @@ class Config:
     dr_step_size: int = 100  # LR scheduler step size
     dr_gamma: float = 0.8  # LR scheduler gamma
     dr_mode: Literal["distance-function", "segmentation"] = "segmentation"  # DR loss target
-
-    seed_search: bool = False  # Coarse-search an initial pose with the collected SAM masks before DR
-    seed_search_base_w2c_index: int = 2  # Record w2c used as seed-search center
-    seed_search_samples: int = 500  # Random seed candidates, plus the unperturbed base
-    seed_search_top_k: int = 10  # Number of top seed candidates to write
-    seed_search_compose: Literal["left", "right"] = "right"  # Compose perturbations left/right of base
-    seed_search_tx: float = 0.6  # Translation search range in meters for x
-    seed_search_ty: float = 0.6  # Translation search range in meters for y
-    seed_search_tz: float = 0.8  # Translation search range in meters for z
-    seed_search_rx_deg: float = 70.0  # Rotation search range in degrees around x
-    seed_search_ry_deg: float = 70.0  # Rotation search range in degrees around y
-    seed_search_rz_deg: float = 70.0  # Rotation search range in degrees around z
-    seed_search_min_area_ratio: float = 0.3  # Reject per-frame renders smaller than this fraction of mask area
-    seed_search_max_area_ratio: float = 2.0  # Reject per-frame renders larger than this many mask areas
-    seed_search_min_hit_frames: int = 3  # Reject candidates with fewer useful frames
-    w2c_translation_scale: float = 1.0  # Scale selected initial w2c translation; <1 moves robot closer
-    w2c_z_scale: float = 1.0  # Scale only selected initial w2c camera-z translation; <1 moves robot closer
-    intrinsics_scale: float = 1.0  # Scale fx/fy during DR rendering; >1 makes render larger
 
     ros_package: str = "xarm_description"  # Robot description package for roboreg
     xacro_path: str = "urdf/xarm_device.urdf.xacro"  # Xacro path relative to ros_package
@@ -117,17 +102,6 @@ class RawWebPolicyClient:
         return unpacked
 
 
-def load_seed_search_module():
-    path = Path(__file__).resolve().parent / "search_roboreg_seed.py"
-    spec = importlib.util.spec_from_file_location("xclients_search_roboreg_seed", path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Failed to load seed-search helper from {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
 def scale_intrinsics(k: np.ndarray, old_h: int, old_w: int, new_h: int, new_w: int) -> np.ndarray:
     out = np.asarray(k, dtype=np.float32).copy()
     out[0, :] *= new_w / float(old_w)
@@ -157,10 +131,16 @@ def model_image(data: dict[str, np.ndarray], size: int) -> tuple[np.ndarray, np.
 
 def load_records(cfg: Config) -> list[Record]:
     paths = sorted(cfg.data_dir.glob("*.npz"))
-    # paths = [paths[i] for i in cfg.data_select] if isinstance(cfg.data_select, list) else paths
-    paths = [paths[i] for i in cfg.data_select if paths != [-1]]
-    print(paths)
-    print(len(paths))
+    if cfg.data_select != [-1]:
+        selected = []
+        for index in cfg.data_select:
+            try:
+                selected.append(paths[index])
+            except IndexError as exc:
+                raise IndexError(
+                    f"data_select index {index} is out of range for {len(paths)} .npz files under {cfg.data_dir}"
+                ) from exc
+        paths = selected
     if cfg.max_records is not None:
         paths = paths[: cfg.max_records]
     if not paths:
@@ -302,8 +282,6 @@ def collect_sam_masks(cfg: Config, records: list[Record]) -> np.ndarray:
             arm_mask, gripper_mask = binarize(arm_mask), binarize(gripper_mask)
             tocv2 = lambda arr: (arr * 255).astype(np.uint8)
             mask = np.logical_and(arm_mask, np.logical_not(gripper_mask)).astype(np.uint8)
-            print("arm mask min", arm_mask.min(), "arm mask max", arm_mask.max())
-            print("gripper mask min", gripper_mask.min(), "gripper mask max", gripper_mask.max())
             write_image(mask_dir / f"{record.stem}_mask.png", tocv2(mask))
             write_image(mask_dir / f"{record.stem}_grippermask.png", tocv2(gripper_mask))
             write_image(mask_dir / f"{record.stem}_arm-mask.png", tocv2(arm_mask))
@@ -377,18 +355,8 @@ def collect_initial_pose(cfg: Config, records: list[Record], masks: np.ndarray) 
     raise ValueError("No record has w2c. Pass --extrinsics-path or use --call-dream to get initial extrinsics.")
 
 
-def apply_initial_pose_scale(ht: np.ndarray, translation_scale: float) -> np.ndarray:
-    out = np.asarray(ht, dtype=np.float32).copy()
-    if translation_scale != 1.0:
-        out[..., :3, 3] *= translation_scale
-    return out
-
-
-def apply_w2c_adjustments(cfg: Config, ht: np.ndarray) -> np.ndarray:
-    out = apply_initial_pose_scale(ht, cfg.w2c_translation_scale)
-    if cfg.w2c_z_scale != 1.0:
-        out[..., 2, 3] *= cfg.w2c_z_scale
-    return out
+def apply_w2c_adjustments(_cfg: Config, ht: np.ndarray) -> np.ndarray:
+    return np.asarray(ht, dtype=np.float32).copy()
 
 
 def select_record_w2c(cfg: Config, records: list[Record], masks: np.ndarray) -> tuple[Record, np.ndarray | None]:
@@ -424,10 +392,6 @@ def score_record_w2c(
 ) -> tuple[Record, np.ndarray]:
     ensure_plugin_src()
 
-    from server_roboreg.common import HydraConfig
-    from server_roboreg.render import Renderer, RendererConfig
-    import torch
-
     bundled_urdf = Path(__file__).resolve().parents[1] / "plugins/server_roboreg/xarm7_standalone.urdf"
     hcfg = HydraConfig(
         ros_package=cfg.ros_package,
@@ -447,9 +411,7 @@ def score_record_w2c(
     joints = torch.tensor(np.stack([record.joints for record in records]), dtype=torch.float32, device=renderer.device)
     mask_bin = masks > 0
     intr = torch.tensor(
-        scaled_intrinsics(
-            np.stack([record.intrinsics for record in records]).astype(np.float32)[0], cfg.intrinsics_scale
-        ),
+        np.stack([record.intrinsics for record in records]).astype(np.float32)[0],
         dtype=torch.float32,
         device=renderer.device,
     )
@@ -501,7 +463,6 @@ def score_record_w2c(
 
 
 def opencv_projection(intr: torch.Tensor, width: int, height: int) -> torch.Tensor:
-    import torch
 
     projection = torch.zeros(4, 4, dtype=intr.dtype, device=intr.device)
     znear, zfar = 0.01, 10.0
@@ -523,7 +484,6 @@ def render_cv_w2c(
     height: int,
     width: int,
 ) -> torch.Tensor:
-    import torch
 
     renderer.scene.robot.configure(joints)
     flip = torch.diag(torch.tensor([1.0, -1.0, -1.0, 1.0], dtype=w2c.dtype, device=w2c.device))
@@ -562,161 +522,8 @@ def ensure_plugin_src() -> None:
         sys.path.insert(0, str(plugin_src))
 
 
-def seed_base_ht(cfg: Config, records: list[Record], ht: np.ndarray) -> np.ndarray:
-    if 0 <= cfg.seed_search_base_w2c_index < len(records):
-        record = records[cfg.seed_search_base_w2c_index]
-        if record.w2c is not None:
-            logging.info("Seed search base w2c: record %d %s", cfg.seed_search_base_w2c_index, record.path)
-            return record.w2c
-    logging.warning("Seed search base record has no w2c; using current initial pose")
-    return ht[0] if ht.ndim == 3 else ht
-
-
-def seed_search_config(cfg: Config):
-    seed_search = load_seed_search_module()
-
-    return seed_search.Config(
-        data_dir=cfg.data_dir,
-        output_dir=cfg.output_dir / "seed_search",
-        image_size=cfg.image_size,
-        samples=cfg.seed_search_samples,
-        top_k=cfg.seed_search_top_k,
-        compose=cfg.seed_search_compose,
-        tx=cfg.seed_search_tx,
-        ty=cfg.seed_search_ty,
-        tz=cfg.seed_search_tz,
-        rx_deg=cfg.seed_search_rx_deg,
-        ry_deg=cfg.seed_search_ry_deg,
-        rz_deg=cfg.seed_search_rz_deg,
-        min_area_ratio=cfg.seed_search_min_area_ratio,
-        max_area_ratio=cfg.seed_search_max_area_ratio,
-        min_hit_frames=cfg.seed_search_min_hit_frames,
-        urdf_path=cfg.urdf_path,
-        root_link_name=cfg.root_link_name,
-        end_link_name=cfg.end_link_name,
-        collision_meshes=cfg.collision_meshes,
-    )
-
-
-def write_seed_candidate(
-    out_dir: Path,
-    rank: int,
-    score: float,
-    ht: np.ndarray,
-    render: np.ndarray,
-    records: list[Record],
-) -> None:
-    from roboreg.util import overlay_mask
-
-    cand_dir = out_dir / f"top_{rank:02d}_{score:.5f}"
-    cand_dir.mkdir(parents=True, exist_ok=True)
-    np.save(cand_dir / "HT_seed.npy", ht)
-    for record, rast in zip(records, render, strict=True):
-        rmask = (rast * 255.0).astype(np.uint8)
-        write_image(cand_dir / "renders" / f"{record.stem}_render.png", rmask)
-        write_image(
-            cand_dir / "overlays" / f"{record.stem}_overlay.png", overlay_mask(record.image, rmask, mode="b", scale=1.0)
-        )
-
-
-def search_seed_pose(cfg: Config, records: list[Record], masks: np.ndarray, ht: np.ndarray) -> np.ndarray:
-    ensure_plugin_src()
-
-    seed_search = load_seed_search_module()
-    from server_roboreg.common import HydraConfig
-    from server_roboreg.render import Renderer, RendererConfig
-    import torch
-
-    scfg = seed_search_config(cfg)
-    out_dir = scfg.output_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for record, mask in zip(records, masks, strict=True):
-        write_image(out_dir / "masks" / f"{record.stem}_mask.png", mask)
-
-    bundled_urdf = Path(__file__).resolve().parents[1] / "plugins/server_roboreg/xarm7_standalone.urdf"
-    hcfg = HydraConfig(
-        ros_package=cfg.ros_package,
-        xacro_path=cfg.xacro_path,
-        urdf=cfg.urdf_path or bundled_urdf,
-        root_link_name=cfg.root_link_name,
-        end_link_name=cfg.end_link_name,
-        collision_meshes=cfg.collision_meshes,
-    )
-    renderer = Renderer(
-        hcfg,
-        RendererConfig(batch_size=len(records)),
-        height=masks[0].shape[0],
-        width=masks[0].shape[1],
-        intr=np.stack([record.intrinsics for record in records]).astype(np.float32)[0],
-    )
-    joints = torch.tensor(np.stack([record.joints for record in records]), dtype=torch.float32, device=renderer.device)
-    base = seed_base_ht(cfg, records, ht)
-    rng = np.random.default_rng(scfg.seed)
-
-    top = []
-    for i in range(scfg.samples + 1):
-        params = np.zeros(6, dtype=np.float32) if i == 0 else seed_search.sample_params(scfg, rng)
-        candidate = seed_search.candidate_matrix(base, params, scfg.compose)
-        candidates = np.repeat(candidate[None], len(records), axis=0)
-        renderer.scene.robot.configure(joints, torch.tensor(candidates, dtype=torch.float32, device=renderer.device))
-        render = renderer.scene.observe_from("camera").detach().cpu().numpy()[..., 0]
-        score, intersection, render_pixels = seed_search.score_render(
-            render,
-            masks,
-            scfg.min_render_pixels,
-            scfg.min_area_ratio,
-            scfg.max_area_ratio,
-            scfg.min_hit_frames,
-        )
-        if score < 0.0:
-            continue
-        top.append((score, intersection, render_pixels, candidate, render, params))
-        top = sorted(top, key=lambda item: item[:3], reverse=True)[: scfg.top_k]
-        if i == 0 or i % 50 == 0:
-            best = top[0] if top else None
-            best_text = "none" if best is None else f"{best[0]:.5f} render_pixels={best[2]}"
-            logging.info("seed search sample %d/%d current=%.5f best=%s", i, scfg.samples, score, best_text)
-
-    if not top:
-        raise RuntimeError("Seed search found no plausible candidate. Relax seed-search area gates or ranges.")
-
-    best_score, best_intersection, best_pixels, best_ht, _, best_params = top[0]
-    np.save(out_dir / "HT_seed.npy", best_ht)
-    np.savez(
-        out_dir / "seed_search.npz",
-        HT_seed=best_ht,
-        score=np.asarray(best_score, dtype=np.float32),
-        intersection=np.asarray(best_intersection, dtype=np.int32),
-        render_pixels=np.asarray(best_pixels, dtype=np.int32),
-        params=np.asarray(best_params, dtype=np.float32),
-    )
-    for rank, (score, _, _, candidate, render, _) in enumerate(top):
-        write_seed_candidate(out_dir, rank, score, candidate, render, records)
-    logging.info(
-        "Seed search best score=%.6f intersection=%d render_pixels=%d wrote %s",
-        best_score,
-        best_intersection,
-        best_pixels,
-        out_dir / "HT_seed.npy",
-    )
-    return best_ht.astype(np.float32)
-
-
 def run_dr(cfg: Config, records: list[Record], masks: np.ndarray, ht: np.ndarray) -> dict:
     ensure_plugin_src()
-
-    try:
-        from server_roboreg.common import DRConfig, HydraConfig, REGISTRATION_MODE
-        from server_roboreg.dr import DR
-    except ModuleNotFoundError as exc:
-        if exc.name == "roboreg":
-            raise RuntimeError(
-                "server_roboreg needs the external roboreg package. Run this script in the "
-                "server_roboreg plugin environment, for example: "
-                f"uv run --project plugins/server_roboreg python {Path(__file__).resolve()} ..."
-            ) from exc
-        raise
-
     bundled_urdf = Path(__file__).resolve().parents[1] / "plugins/server_roboreg/xarm7_standalone.urdf"
     hcfg = HydraConfig(
         ros_package=cfg.ros_package,
@@ -739,21 +546,11 @@ def run_dr(cfg: Config, records: list[Record], masks: np.ndarray, ht: np.ndarray
         "images": np.stack([record.image for record in records]).astype(np.uint8),
         "joints": np.stack([record.joints for record in records]).astype(np.float32),
         "mask": masks.astype(np.uint8),
-        "intrinsics": scaled_intrinsics(
-            np.stack([record.intrinsics for record in records]).astype(np.float32)[0],
-            cfg.intrinsics_scale,
-        ),
+        "intrinsics": np.stack([record.intrinsics for record in records]).astype(np.float32)[0],
         "HT": ht.astype(np.float32),
         "ht_is_cv_w2c": True,
     }
     return DR(hcfg.dr, hcfg).step(payload)
-
-
-def scaled_intrinsics(k: np.ndarray, scale: float) -> np.ndarray:
-    out = np.asarray(k, dtype=np.float32).copy()
-    out[0, 0] *= scale
-    out[1, 1] *= scale
-    return out
 
 
 def save_outputs(cfg: Config, records: list[Record], masks: np.ndarray, initial: dict, dr_out: dict | None) -> None:
@@ -838,8 +635,6 @@ def main(cfg: Config) -> None:
     masks = collect_sam_masks(cfg, records)
     initial = collect_initial_pose(cfg, records, masks)
     ht = assert_dream_pose(initial, len(records))
-    if cfg.run_dr and cfg.seed_search:
-        ht = search_seed_pose(cfg, records, masks, ht)
 
     dr_out = run_dr(cfg, records, masks, ht) if cfg.run_dr else None
     print(dr_out)
