@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import logging
 import os
 from pathlib import Path
 
@@ -16,6 +15,13 @@ import torch
 from tqdm import tqdm
 
 from server_roboreg.common import HydraConfig
+from server_roboreg.logging_utils import (
+    log_renderer_init,
+    log_renderer_ros_scene,
+    log_renderer_sample,
+    log_renderer_step,
+    log_renderer_urdf,
+)
 
 
 @dataclass
@@ -47,13 +53,12 @@ class Renderer:
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         os.environ["MAX_JOBS"] = str(self.rcfg.max_jobs)
-        logging.info(
-            "Initializing Renderer device=%s batch_size=%d resolution=(%d, %d) urdf=%s",
+        log_renderer_init(
             self.device,
             self.rcfg.batch_size,
             height,
             width,
-            cfg.urdf or None,
+            cfg.urdf,
         )
 
         camera = {
@@ -66,7 +71,7 @@ class Renderer:
         }
 
         if cfg.urdf:
-            logging.info("Creating robot scene from local URDF: %s", cfg.urdf)
+            log_renderer_urdf(cfg.urdf)
             self.scene = create_robot_scene_from_urdf(
                 batch_size=rcfg.batch_size,
                 urdf_path=cfg.urdf,
@@ -77,7 +82,7 @@ class Renderer:
                 collision=cfg.collision_meshes,
             )
         else:
-            logging.info("Creating robot scene from ROS package=%s xacro=%s", cfg.ros_package, cfg.xacro_path)
+            log_renderer_ros_scene(cfg.ros_package, cfg.xacro_path)
             self.scene = create_robot_scene(
                 batch_size=rcfg.batch_size,
                 ros_package=cfg.ros_package,
@@ -143,15 +148,14 @@ class Renderer:
         if joints.ndim == 1:
             joints = joints.unsqueeze(0)
 
-        logging.info("Renderer.step images_shape=%s joints_shape=%s", images_np.shape, tuple(joints.shape))
+        log_renderer_step(images_np.shape, tuple(joints.shape))
 
         overlays: list[np.ndarray] = []
         for index, (j, im) in enumerate(tqdm(zip(joints, images_np, strict=False))):
             self.scene.robot.configure(j.reshape(1, -1))
             renders = self.scene.observe_from(self.camera_name)
             render_masks = (renders * 255.0).squeeze(-1).cpu().numpy().astype(np.uint8)
-            logging.info(
-                "Renderer.step sample=%d image_shape=%s render_shape=%s render_mean=%.6f",
+            log_renderer_sample(
                 index,
                 im.shape,
                 render_masks.shape,

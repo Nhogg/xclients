@@ -1,19 +1,27 @@
 from __future__ import annotations
 
 import importlib
-import logging
 import os
 
 import jax
 import numpy as np
 import pytorch_kinematics as pk
-import rich
-import rich.progress
 from roboreg.losses import soft_dice_loss
 from roboreg.util import mask_distance_transform, mask_exponential_decay, overlay_mask
 import torch
 
 from server_roboreg.common import DRConfig, HydraConfig, REGISTRATION_MODE
+from server_roboreg.logging_utils import (
+    log_dr_batch_stats,
+    log_dr_complete,
+    log_dr_output_sample,
+    log_dr_payload,
+    log_dr_setup,
+    log_dr_step,
+    optimization_progress,
+    print_dr_batch_stats,
+    print_dr_step,
+)
 from server_roboreg.render import Renderer, RendererConfig
 
 
@@ -66,9 +74,6 @@ class DR:
 
         self.modefn = mask_distance_transform if mode == REGISTRATION_MODE.DISTANCE_FUNCTION else mask_exponential_decay
         self.r = None
-
-    def log_info(self, msg: str, *args: object) -> None:
-        logging.info(msg, *args)
 
     @staticmethod
     def _as_batch(value: object, name: str) -> np.ndarray:
@@ -126,43 +131,6 @@ class DR:
     ) -> torch.Tensor:
         return render_cv_w2c(self.r, joints, w2c, intr, height, width)
 
-    @staticmethod
-    def _print_batch_stats(iteration: int, targets: torch.Tensor, renders: torch.Tensor) -> None:
-        target = targets.detach().squeeze(-1)
-        render = renders.detach().squeeze(-1)
-        target_bin = target > 0.0
-        render_bin = render > 0.5
-        inter = (target_bin & render_bin).sum(dim=(1, 2)).float()
-        union = (target_bin | render_bin).sum(dim=(1, 2)).float()
-        iou = torch.where(union > 0.0, inter / union, torch.zeros_like(union))
-        target_mean = target.mean(dim=(1, 2))
-        render_mean = render.mean(dim=(1, 2))
-        for i, (tm, rm, miou) in enumerate(zip(target_mean, render_mean, iou, strict=True)):
-            rich.print(
-                f"Step {iteration} sample {i}: target_mean={tm.item():.4f}, "
-                f"render_mean={rm.item():.4f}, mask_iou={miou.item():.4f}"
-            )
-
-    def _log_batch_stats(self, iteration: int, targets: torch.Tensor, renders: torch.Tensor) -> None:
-        target = targets.detach().squeeze(-1)
-        render = renders.detach().squeeze(-1)
-        target_bin = target > 0.0
-        render_bin = render > 0.5
-        inter = (target_bin & render_bin).sum(dim=(1, 2)).float()
-        union = (target_bin | render_bin).sum(dim=(1, 2)).float()
-        iou = torch.where(union > 0.0, inter / union, torch.zeros_like(union))
-        target_mean = target.mean(dim=(1, 2))
-        render_mean = render.mean(dim=(1, 2))
-        for i, (tm, rm, miou) in enumerate(zip(target_mean, render_mean, iou, strict=True)):
-            logging.info(
-                "DR step=%d sample=%d target_mean=%.6f render_mean=%.6f mask_iou=%.6f",
-                iteration,
-                i,
-                tm.item(),
-                rm.item(),
-                miou.item(),
-            )
-
     def validate(self, payload: dict):
         if "images" in payload:
             images_raw = self._as_batch(payload["images"], "images")
@@ -202,8 +170,7 @@ class DR:
             raise KeyError("DR payload must include an initial HT transform.")
 
         h, w = masks[0].shape[:2]
-        self.log_info(
-            "DR payload batch=%d image_shape=%s mask_shape=%s joints_shape=%s ht_shape=%s",
+        log_dr_payload(
             len(images),
             images[0].shape,
             masks[0].shape,
@@ -243,9 +210,7 @@ class DR:
             raise ValueError(f"Expected intrinsics with shape (3, 3) or (B, 3, 3), got {tuple(intr.shape)}")
         if intr.ndim == 3 and intr.shape[0] != len(joints):
             raise ValueError(f"Batched intrinsics count {intr.shape[0]} does not match batch size {len(joints)}")
-        self.log_info(
-            "DR setup mode=%s optimizer=%s lr=%.6g iterations=%d optimize_cv_w2c=%s ht_is_root=%s "
-            "optimize_intrinsics=%s intrinsics=%s",
+        log_dr_setup(
             self.cfg.mode.value,
             self.cfg.optimizer,
             self.cfg.lr,
@@ -274,7 +239,7 @@ class DR:
         best_intr = intr.detach().clone()
         best_loss = float("inf")
 
-        for iteration in rich.progress.track(range(1, self.cfg.max_iterations + 1), "Optimizing..."):
+        for iteration in optimization_progress(range(1, self.cfg.max_iterations + 1)):
             if not root_transform_9d.requires_grad:
                 raise ValueError("Extrinsics require gradients.")
             if not torch.is_grad_enabled():
@@ -296,8 +261,8 @@ class DR:
                 raise ValueError("Invalid registration mode.")
 
             if iteration == 1 or iteration == self.cfg.max_iterations or iteration % self.cfg.step_size == 0:
-                self._print_batch_stats(iteration, targets, renders["camera"])
-                self._log_batch_stats(iteration, targets, renders["camera"])
+                print_dr_batch_stats(iteration, targets, renders["camera"])
+                log_dr_batch_stats(iteration, targets, renders["camera"])
 
             optimizer.zero_grad()
             loss.backward()
@@ -305,12 +270,8 @@ class DR:
             scheduler.step()
             lr = scheduler.get_last_lr()[0]
 
-            rich.print(
-                f"Step [{iteration} / {self.cfg.max_iterations}], loss: {np.round(loss.item(), 3)}, "
-                f"best loss: {np.round(best_loss, 3)}, lr: {lr}"
-            )
-            self.log_info(
-                "DR step=%d/%d loss=%.6f best_loss=%.6f lr=%.6g",
+            print_dr_step(iteration, self.cfg.max_iterations, loss.item(), best_loss, lr)
+            log_dr_step(
                 iteration,
                 self.cfg.max_iterations,
                 loss.item(),
@@ -346,8 +307,7 @@ class DR:
 
             rmask = (render * 255.0).astype(np.uint8)
             rimg = np.stack([rmask, rmask, rmask], axis=-1)
-            self.log_info(
-                "DR output sample=%d image_minmax=(%d,%d) render_minmax=(%d,%d) mask_mean=%.6f",
+            log_dr_output_sample(
                 i,
                 int(im.min()),
                 int(im.max()),
@@ -376,7 +336,7 @@ class DR:
 
         outs = jax.tree.map(lambda *x: np.stack(x), *outs)
         outs = outs | {"HT": best_extrinsics.cpu().numpy()}
-        self.log_info("DR complete best_loss=%.6f HT=%s", best_loss, outs["HT"])
+        log_dr_complete(best_loss, outs["HT"])
         return outs
 
 
@@ -431,7 +391,7 @@ def mono(
     best_extrinsics_inv = extrinsics_inv
     best_loss = float("inf")
 
-    for iteration in rich.progress.track(range(1, args.max_iterations + 1), "Optimizing..."):
+    for iteration in optimization_progress(range(1, args.max_iterations + 1)):
         if not extrinsics_9d_inv.requires_grad:
             raise ValueError("Extrinsics require gradients.")
         if not torch.is_grad_enabled():
@@ -452,10 +412,9 @@ def mono(
         loss.backward()
         optimizer.step()
         scheduler.step()
+        lr = scheduler.get_last_lr()[0]
 
-        rich.print(
-            f"Step [{iteration} / {args.max_iterations}], loss: {np.round(loss.item(), 3)}, best loss: {np.round(best_loss, 3)}, lr: {scheduler.get_last_lr().pop()}"
-        )
+        print_dr_step(iteration, args.max_iterations, loss.item(), best_loss, lr)
 
         if loss.item() < best_loss:
             best_loss = loss.item()
