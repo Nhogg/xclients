@@ -10,9 +10,6 @@ from typing import Literal
 
 import cv2
 import numpy as np
-from server_roboreg.common import DRConfig, HydraConfig, REGISTRATION_MODE
-from server_roboreg.dr import DR
-from server_roboreg.render import Renderer, RendererConfig
 import torch
 import tyro
 import webpolicy.client as webpolicy_client
@@ -392,6 +389,9 @@ def score_record_w2c(
 ) -> tuple[Record, np.ndarray]:
     ensure_plugin_src()
 
+    from server_roboreg.common import HydraConfig
+    from server_roboreg.render import Renderer, RendererConfig
+
     bundled_urdf = Path(__file__).resolve().parents[1] / "plugins/server_roboreg/xarm7_standalone.urdf"
     hcfg = HydraConfig(
         ros_package=cfg.ros_package,
@@ -524,6 +524,9 @@ def ensure_plugin_src() -> None:
 
 def run_dr(cfg: Config, records: list[Record], masks: np.ndarray, ht: np.ndarray) -> dict:
     ensure_plugin_src()
+    from server_roboreg.common import DRConfig, HydraConfig, REGISTRATION_MODE
+    from server_roboreg.dr import DR
+
     bundled_urdf = Path(__file__).resolve().parents[1] / "plugins/server_roboreg/xarm7_standalone.urdf"
     hcfg = HydraConfig(
         ros_package=cfg.ros_package,
