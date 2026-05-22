@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 import sys
 import time
+from typing import Literal
 
 import cv2
 import numpy as np
@@ -28,6 +29,7 @@ class Config:
     port: int = 8000
     da_host: str | None = None
     da_port: int | None = None
+    call_dream: bool = True  # Call Dream for masks/raster/w2c; disable to use only --ht-path for camera pose
     camera: str | int = 0  # OpenCV camera index to poll from
     camera_name: str = "dream"  # Rerun camera entity name
     image_size: int = 200  # Resize frames to a square image before sending to Dream
@@ -35,6 +37,8 @@ class Config:
     fy: float = 515.0  # Focal length in pixels along y for the payload K matrix
     q: list[float] = field(default_factory=lambda: [0.0] * 7)  # Joint vector sent to Dream and logged to Rerun
     deg2rad: bool = False  # Convert cfg.q from degrees to radians before sending
+    ht_path: Path | None = None  # Optional .npy/.npz file containing a precomputed HT extrinsics matrix
+    ht_convention: Literal["cv-w2c", "camera-file"] = "cv-w2c"  # Convention for --ht-path matrices
     urdf: Path = Path("xarm7_standalone.urdf")
     app_id: str = "dream_view"
     entity_path_prefix: str = "robot"
@@ -51,6 +55,8 @@ class Config:
 
     def __post_init__(self) -> None:
         self.urdf = self.urdf.expanduser().resolve()
+        if self.ht_path is not None:
+            self.ht_path = Path(self.ht_path).expanduser().resolve()
         if self.rrd_path is not None:
             self.rrd_path = Path(self.rrd_path).expanduser().resolve()
         if (self.da_host is None) != (self.da_port is None):
@@ -161,7 +167,7 @@ def send_dream_blueprint(scene: RerunScene, camera_name: str) -> None:
             ),
             rrb.Vertical(
                 contents=[
-                    rrb.Spatial2DView(origin=cam_root, contents=["+ $origin/image"]),
+                    rrb.Spatial2DView(origin=cam_root, contents=["+ $origin/image", "+ /robot/**"]),
                     rrb.Spatial2DView(origin=cam_root, contents=["+ $origin/mask"]),
                     rrb.Spatial2DView(origin=cam_root, contents=["+ $origin/raster"]),
                     rrb.Spatial2DView(origin=cam_root, contents=["+ $origin/depth"]),
@@ -189,6 +195,41 @@ def coerce_w2c_pose(w2c: np.ndarray | None) -> np.ndarray | None:
         raise ValueError(f"Expected w2c with shape (4, 4), got {pose.shape}")
 
     return pose
+
+
+def load_ht(path: Path) -> np.ndarray:
+    data = np.load(path)
+    if isinstance(data, np.lib.npyio.NpzFile):
+        try:
+            if "HT" in data.files:
+                ht = data["HT"]
+            elif len(data.files) == 1:
+                ht = data[data.files[0]]
+            else:
+                raise ValueError(f"Expected {path} to contain an 'HT' array; found {data.files}")
+        finally:
+            data.close()
+    else:
+        ht = data
+
+    pose = coerce_w2c_pose(ht)
+    if pose is None:
+        raise ValueError(f"Expected {path} to contain an HT pose.")
+    if not np.isfinite(pose).all():
+        raise ValueError(f"HT pose from {path} has non-finite values: {pose!r}")
+    if not np.allclose(pose[3], np.array([0.0, 0.0, 0.0, 1.0]), atol=1e-5):
+        raise ValueError(f"Expected HT pose bottom row to be [0, 0, 0, 1], got {pose[3]}")
+    return pose
+
+
+def ht_to_rerun_extrinsics(ht: np.ndarray) -> np.ndarray:
+    return ht
+
+
+def camera_file_ht_to_rerun_extrinsics(ht: np.ndarray) -> np.ndarray:
+    from xclients.core import tf as xctf
+
+    return xctf.RDF2FLU @ np.linalg.inv(ht)
 
 
 def dream_camera_calibration(k: np.ndarray, w2c: np.ndarray, width: int, height: int) -> dict[str, np.ndarray | int]:
@@ -364,8 +405,23 @@ def unproject_depth_points(
 
 
 def main(cfg: Config) -> None:
-    client = Client(cfg.host, cfg.port)
+    client = Client(cfg.host, cfg.port) if cfg.call_dream else None
     da_client = Client(cfg.da_host, cfg.da_port) if cfg.da_host is not None and cfg.da_port is not None else None
+    ht_payload = load_ht(cfg.ht_path) if cfg.ht_path is not None else None
+    ht_rerun_pose = None
+    if ht_payload is not None:
+        ht_rerun_pose = (
+            ht_to_rerun_extrinsics(ht_payload)
+            if cfg.ht_convention == "cv-w2c"
+            else camera_file_ht_to_rerun_extrinsics(ht_payload)
+        )
+    if ht_payload is not None:
+        logging.info("Loaded precomputed HT extrinsics from %s using %s convention", cfg.ht_path, cfg.ht_convention)
+    if client is None and ht_rerun_pose is None:
+        raise ValueError("Pass --ht-path when using --no-call-dream; otherwise no camera extrinsics are available.")
+    if da_client is None:
+        logging.warning("No DA client configured; depth point cloud logging is disabled.")
+
     cap = cv2.VideoCapture(cfg.camera)
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open camera {cfg.camera}")
@@ -392,7 +448,10 @@ def main(cfg: Config) -> None:
     step = 0
     camera_history: deque[np.ndarray] = deque(maxlen=max(1, int(cfg.history)))
     depth_history: deque[tuple[np.ndarray, np.ndarray]] = deque(maxlen=max(1, int(cfg.depth_history)))
-    logging.info("Polling camera %s and sending frames to %s:%s", cfg.camera, cfg.host, cfg.port)
+    if client is not None:
+        logging.info("Polling camera %s and sending frames to Dream at %s:%s", cfg.camera, cfg.host, cfg.port)
+    else:
+        logging.info("Polling camera %s with fixed HT extrinsics and no Dream calls", cfg.camera)
     while cfg.limit is None or step < cfg.limit:
         ret, frame = cap.read()
         if not ret:
@@ -414,15 +473,19 @@ def main(cfg: Config) -> None:
         rr.set_time("step", sequence=step)
         rr.set_time("time", duration=time.monotonic() - start)
         scene.log_camera_images({cfg.camera_name: frame})
-        scene.log_joints(joint_values_from_q(scene, q_cfg), step=step, degrees=True)
+        scene.log_joints(joint_values_from_q(scene, q_cfg), step=step, degrees=cfg.deg2rad)
 
-        payload = {
-            "image": frame_model,
-            "type": "image",
-            "q": q_payload,
-            "K": k_model,
-        }
-        out = client.step(payload)
+        out = None
+        if client is not None:
+            payload = {
+                "image": frame_model,
+                "type": "image",
+                "q": q_payload,
+                "K": k_model,
+            }
+            if ht_payload is not None:
+                payload["HT"] = ht_payload.astype(np.float32)
+            out = client.step(payload)
 
         da_out = None
         if da_client is not None:
@@ -450,12 +513,13 @@ def main(cfg: Config) -> None:
         if depth_vis is not None:
             log_aux_image(scene, cfg.camera_name, depth_path, depth_vis)
 
-        pose = coerce_w2c_pose(out.get("w2c") if out else None)
+        dream_pose = coerce_w2c_pose(out.get("w2c") if out else None)
+        pose = ht_rerun_pose if ht_rerun_pose is not None else dream_pose
         calibration = None
         if pose is not None:
             calibration = dream_camera_calibration(k_orig, pose, w, h)
             calibration["extrinsics"] = pose
-        print("depth raw shape", depth_raw.shape)
+        print("depth raw shape", depth_raw.shape if depth_raw is not None else None)
         if depth_raw is not None and calibration is not None:
             depth_intr = first_array(da_out.get("intrinsics") if da_out else None)
             print("viewer depth_raw shape", depth_raw.shape)
@@ -470,7 +534,10 @@ def main(cfg: Config) -> None:
             print("da3 is_metric", da_out.get("is_metric") if da_out else None)
             print("da3 scale_factor", da_out.get("scale_factor") if da_out else None)
             print("depth min / max", np.nanmin(depth_raw), np.nanmax(depth_raw))
-            print("dream w2c", pose)
+            print("dream w2c", dream_pose)
+            if ht_payload is not None:
+                print("precomputed HT", ht_payload)
+                print("precomputed HT rerun extrinsics", ht_rerun_pose)
             print("dream pnp reproj", out.get("pnp_reproj_px") if out else None)
             print("dream mask_iou", out.get("mask_iou") if out else None)
 
@@ -501,8 +568,8 @@ def main(cfg: Config) -> None:
                 for i, uv in enumerate(kps):
                     if uv[0] < -900:
                         continue
-                    x = int(round(float(uv[0]) * sx))
-                    y = int(round(float(uv[1]) * sy))
+                    x = round(float(uv[0]) * sx)
+                    y = round(float(uv[1]) * sy)
                     if 0 <= x < depth_raw.shape[1] and 0 <= y < depth_raw.shape[0]:
                         da_z = float(depth_raw[y, x])
                         if pts_cam is not None and i < len(pts_cam):
@@ -571,7 +638,7 @@ def main(cfg: Config) -> None:
             except (ValueError, np.linalg.LinAlgError) as exc:
                 logging.warning("Skipping invalid Dream camera pose at step %d: %s", step, exc)
         else:
-            logging.warning("Dream response did not include a valid w2c pose at step %d", step)
+            logging.warning("No precomputed HT or valid Dream w2c pose available at step %d", step)
 
         if cfg.show:
             cv2.imshow(f"Dream {cfg.camera}", frame)
