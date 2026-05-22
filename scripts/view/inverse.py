@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import time
 
 import cv2
 import numpy as np
@@ -31,6 +32,7 @@ class Config:
     transforms_path: str = "robot/transforms"
     spawn: bool = True
     rrd_path: Path | None = None
+    hold_seconds: float = 0.0  # 0 keeps the live Rerun stream open until Ctrl-C
     keypoint_links: tuple[str, ...] = (
         "link_base",
         "link1",
@@ -387,6 +389,18 @@ def main(cfg: Config) -> None:
     logging.info("World-to-camera: %s", w2c_path)
     logging.info("camera_to_world:\n%s", np.array2string(c2w, precision=5))
     logging.info("Projected %d/%d Pyroki keypoints into the camera image", int(valid.sum()), len(valid))
+
+    if cfg.rrd_path is None:
+        if cfg.hold_seconds > 0.0:
+            logging.info("Holding Rerun stream open for %.1f seconds", cfg.hold_seconds)
+            time.sleep(cfg.hold_seconds)
+        else:
+            logging.info("Holding Rerun stream open; press Ctrl-C to exit")
+            try:
+                while True:
+                    time.sleep(1.0)
+            except KeyboardInterrupt:
+                logging.info("Exiting on Ctrl-C")
 
 
 if __name__ == "__main__":
