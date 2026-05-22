@@ -4,7 +4,6 @@ from collections import deque
 from dataclasses import dataclass, field
 import logging
 from pathlib import Path
-import sys
 import time
 from typing import Literal
 
@@ -29,7 +28,7 @@ class Config:
     port: int = 8000
     da_host: str | None = None
     da_port: int | None = None
-    call_dream: bool = True  # Call Dream for masks/raster/w2c; disable to use only --ht-path for camera pose
+    call_dream: bool = False  # Call Dream for masks/raster/w2c; disabled by default for precomputed HT viewing
     camera: str | int = 0  # OpenCV camera index to poll from
     camera_name: str = "dream"  # Rerun camera entity name
     image_size: int = 200  # Resize frames to a square image before sending to Dream
@@ -39,6 +38,7 @@ class Config:
     deg2rad: bool = False  # Convert cfg.q from degrees to radians before sending
     ht_path: Path | None = None  # Optional .npy/.npz file containing a precomputed HT extrinsics matrix
     ht_convention: Literal["cv-w2c", "camera-file"] = "cv-w2c"  # Convention for --ht-path matrices
+    record_index: int = 0  # Saved record index from ht_path/metadata.json or sorted sibling rr_good records
     urdf: Path = Path("xarm7_standalone.urdf")
     app_id: str = "dream_view"
     entity_path_prefix: str = "robot"
@@ -50,6 +50,7 @@ class Config:
     max_camera_distance: float = 3.0  # Skip Dream poses whose camera center is farther than this many meters
     depth_stride: int = 4  # Subsample factor when converting depth maps to 3D points
     max_depth: float = 2.0  # Maximum depth in meters to include in the point cloud
+    depth_scale: float = 1.0  # Scale factor applied to DA depth before unprojection
     depth_history: int = 10  # Number of recent DA point clouds to keep, fading older clouds by opacity
     show: bool = False  # Also show the local OpenCV window
 
@@ -138,6 +139,97 @@ def draw_depth_image(depth: np.ndarray | None) -> np.ndarray | None:
     return cv2.applyColorMap(depth_u8, cv2.COLORMAP_TURBO)
 
 
+@dataclass
+class RecordFrame:
+    path: Path
+    frame: np.ndarray
+    intrinsics: np.ndarray
+    joints: np.ndarray
+    joints_are_degrees: bool
+
+
+def read_metadata(path: Path) -> dict:
+    meta = path / "metadata.json"
+    if not meta.exists():
+        return {}
+    with meta.open() as f:
+        import json
+
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected metadata object in {meta}")
+    return data
+
+
+def resolve_record_path(raw: object, base: Path) -> Path | None:
+    if not isinstance(raw, str):
+        return None
+    path = Path(raw).expanduser()
+    candidates = [path]
+    if not path.is_absolute():
+        candidates.append(base / path)
+    candidates.append(base.parent / path.parent.name / path.name)
+    for candidate in candidates:
+        resolved = candidate.expanduser().resolve()
+        if resolved.exists():
+            return resolved
+    return None
+
+
+def record_paths_from_ht_dir(path: Path) -> list[Path]:
+    meta = read_metadata(path)
+    records = []
+    for raw in meta.get("records", []):
+        record = resolve_record_path(raw, path)
+        if record is not None:
+            records.append(record)
+    if records:
+        return records
+
+    rr_good = path.parent / "rr_good"
+    if rr_good.exists():
+        return sorted(rr_good.glob("*.npz"))
+    return []
+
+
+def squeeze_record_image(arr: np.ndarray) -> np.ndarray:
+    image = np.asarray(arr)
+    while image.ndim > 3 and image.shape[0] == 1:
+        image = image[0]
+    if image.ndim != 3 or image.shape[-1] != 3:
+        raise ValueError(f"Expected saved record image with shape (h, w, 3), got {image.shape}")
+    return image.astype(np.uint8, copy=False)
+
+
+def load_record_frame(path: Path) -> RecordFrame:
+    with np.load(path, allow_pickle=False) as data:
+        arrays = {key: data[key] for key in data.files}
+
+    image_raw = arrays["image_model"] if "image_model" in arrays else arrays["image"]
+    image = squeeze_record_image(image_raw)
+    joints = np.asarray(arrays["joints"], dtype=np.float32).reshape(-1)[:7]
+    joints_are_degrees = not bool(np.asarray(arrays.get("joints_is_radian", True)))
+    return RecordFrame(
+        path=path,
+        frame=image,
+        intrinsics=np.asarray(arrays["K"], dtype=np.float32),
+        joints=joints,
+        joints_are_degrees=joints_are_degrees,
+    )
+
+
+def load_config_record_frame(cfg: Config) -> RecordFrame | None:
+    if cfg.ht_path is None:
+        return None
+    record_base = cfg.ht_path if cfg.ht_path.is_dir() else cfg.ht_path.parent
+    paths = record_paths_from_ht_dir(record_base)
+    if not paths:
+        return None
+    if cfg.record_index < 0 or cfg.record_index >= len(paths):
+        raise IndexError(f"record_index={cfg.record_index} outside saved record range 0..{len(paths) - 1}")
+    return load_record_frame(paths[cfg.record_index])
+
+
 def ensure_bgr_image(image: np.ndarray | None) -> np.ndarray | None:
     if image is None:
         return None
@@ -197,16 +289,31 @@ def coerce_w2c_pose(w2c: np.ndarray | None) -> np.ndarray | None:
     return pose
 
 
-def load_ht(path: Path) -> np.ndarray:
-    data = np.load(path)
+def resolve_ht_path(path: Path) -> Path:
+    if path.is_dir():
+        for name in ("HT_dr.npy", "HT_rr.npz", "HT_rr.npy", "HT_initial.npy", "HT_dream.npy"):
+            candidate = path / name
+            if candidate.exists():
+                return candidate
+        raise FileNotFoundError(f"No HT file found in {path}; expected HT_dr.npy, HT_rr.npz, or similar")
+    return path
+
+
+def load_ht(path: Path) -> tuple[np.ndarray, Path]:
+    source = resolve_ht_path(path)
+    data = np.load(source)
     if isinstance(data, np.lib.npyio.NpzFile):
         try:
             if "HT" in data.files:
                 ht = data["HT"]
+            elif "HT_dr" in data.files:
+                ht = data["HT_dr"]
+            elif "HT_rr" in data.files:
+                ht = data["HT_rr"]
             elif len(data.files) == 1:
                 ht = data[data.files[0]]
             else:
-                raise ValueError(f"Expected {path} to contain an 'HT' array; found {data.files}")
+                raise ValueError(f"Expected {source} to contain an HT array; found {data.files}")
         finally:
             data.close()
     else:
@@ -214,12 +321,12 @@ def load_ht(path: Path) -> np.ndarray:
 
     pose = coerce_w2c_pose(ht)
     if pose is None:
-        raise ValueError(f"Expected {path} to contain an HT pose.")
+        raise ValueError(f"Expected {source} to contain an HT pose.")
     if not np.isfinite(pose).all():
-        raise ValueError(f"HT pose from {path} has non-finite values: {pose!r}")
+        raise ValueError(f"HT pose from {source} has non-finite values: {pose!r}")
     if not np.allclose(pose[3], np.array([0.0, 0.0, 0.0, 1.0]), atol=1e-5):
         raise ValueError(f"Expected HT pose bottom row to be [0, 0, 0, 1], got {pose[3]}")
-    return pose
+    return pose, source
 
 
 def ht_to_rerun_extrinsics(ht: np.ndarray) -> np.ndarray:
@@ -407,7 +514,11 @@ def unproject_depth_points(
 def main(cfg: Config) -> None:
     client = Client(cfg.host, cfg.port) if cfg.call_dream else None
     da_client = Client(cfg.da_host, cfg.da_port) if cfg.da_host is not None and cfg.da_port is not None else None
-    ht_payload = load_ht(cfg.ht_path) if cfg.ht_path is not None else None
+    record_frame = load_config_record_frame(cfg)
+    ht_source = None
+    ht_payload = None
+    if cfg.ht_path is not None:
+        ht_payload, ht_source = load_ht(cfg.ht_path)
     ht_rerun_pose = None
     if ht_payload is not None:
         ht_rerun_pose = (
@@ -416,15 +527,19 @@ def main(cfg: Config) -> None:
             else camera_file_ht_to_rerun_extrinsics(ht_payload)
         )
     if ht_payload is not None:
-        logging.info("Loaded precomputed HT extrinsics from %s using %s convention", cfg.ht_path, cfg.ht_convention)
+        logging.info("Loaded precomputed HT extrinsics from %s using %s convention", ht_source, cfg.ht_convention)
     if client is None and ht_rerun_pose is None:
         raise ValueError("Pass --ht-path when using --no-call-dream; otherwise no camera extrinsics are available.")
     if da_client is None:
         logging.warning("No DA client configured; depth point cloud logging is disabled.")
 
-    cap = cv2.VideoCapture(cfg.camera)
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open camera {cfg.camera}")
+    cap = None
+    if record_frame is None:
+        cap = cv2.VideoCapture(cfg.camera)
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open camera {cfg.camera}")
+    else:
+        logging.info("Rendering saved record %s; live camera is disabled", record_frame.path)
 
     scene = RerunScene(
         cfg.urdf,
@@ -441,8 +556,9 @@ def main(cfg: Config) -> None:
     scene.set_cameras([cfg.camera_name])
     send_dream_blueprint(scene, cfg.camera_name)
 
-    q_cfg = np.asarray(cfg.q, dtype=np.float32)
-    q_payload = np.deg2rad(q_cfg) if cfg.deg2rad else q_cfg
+    q_cfg = np.asarray(record_frame.joints if record_frame is not None else cfg.q, dtype=np.float32)
+    q_degrees = bool(record_frame.joints_are_degrees) if record_frame is not None else bool(cfg.deg2rad)
+    q_payload = np.deg2rad(q_cfg) if q_degrees else q_cfg
 
     start = time.monotonic()
     step = 0
@@ -450,30 +566,39 @@ def main(cfg: Config) -> None:
     depth_history: deque[tuple[np.ndarray, np.ndarray]] = deque(maxlen=max(1, int(cfg.depth_history)))
     if client is not None:
         logging.info("Polling camera %s and sending frames to Dream at %s:%s", cfg.camera, cfg.host, cfg.port)
+    elif record_frame is not None:
+        logging.info("Rendering saved record with fixed HT extrinsics and no Dream calls")
     else:
         logging.info("Polling camera %s with fixed HT extrinsics and no Dream calls", cfg.camera)
-    while cfg.limit is None or step < cfg.limit:
-        ret, frame = cap.read()
-        if not ret:
-            logging.error("Failed to read frame from camera %s", cfg.camera)
-            continue
+    run_limit = 1 if record_frame is not None and cfg.limit is None else cfg.limit
+    while run_limit is None or step < run_limit:
+        if record_frame is not None:
+            frame = record_frame.frame
+            k_orig = record_frame.intrinsics
+        else:
+            assert cap is not None
+            ret, frame = cap.read()
+            if not ret:
+                logging.error("Failed to read frame from camera %s", cfg.camera)
+                continue
+            h, w = frame.shape[:2]
+            k_orig = np.array(
+                [
+                    [cfg.fx, 0.0, w / 2.0],
+                    [0.0, cfg.fy, h / 2.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float32,
+            )
 
         h, w = frame.shape[:2]
         frame_model = cv2.resize(frame, (cfg.image_size, cfg.image_size), interpolation=cv2.INTER_LINEAR)
-        k_orig = np.array(
-            [
-                [cfg.fx, 0.0, w / 2.0],
-                [0.0, cfg.fy, h / 2.0],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=np.float32,
-        )
         k_model = scale_intrinsics(k_orig, cfg.image_size / float(w), cfg.image_size / float(h))
 
         rr.set_time("step", sequence=step)
         rr.set_time("time", duration=time.monotonic() - start)
         scene.log_camera_images({cfg.camera_name: frame})
-        scene.log_joints(joint_values_from_q(scene, q_cfg), step=step, degrees=cfg.deg2rad)
+        scene.log_joints(joint_values_from_q(scene, q_cfg), step=step, degrees=q_degrees)
 
         out = None
         if client is not None:
@@ -493,11 +618,11 @@ def main(cfg: Config) -> None:
                 "image": [frame],
                 "intrinsics": np.array([k_orig], dtype=np.float32),
             }
-            print("DA3 input k_orig", k_orig)
-            print("DA3 input frame shape", frame.shape)
-            da_out = da_client.step(da_payload)
-            print("DA3 output intrinsics", first_array(da_out.get("intrinsics")))
-            print("DA3 output depth shape", first_array(da_out.get("depth")).shape)
+            try:
+                da_out = da_client.step(da_payload)
+            except Exception as exc:
+                logging.warning("Skipping Depth Anything point cloud at step %d: %s", step, exc)
+                da_client = None
 
         mask = draw_mask(out.get("mask") if out else None)
         raster_raw = out.get("raster_image") if out else None
@@ -505,6 +630,19 @@ def main(cfg: Config) -> None:
             raster_raw = out.get("rast_image")
         raster = draw_output_image(raster_raw)
         depth_raw = first_array(da_out.get("depth") if da_out else None)
+        if depth_raw is not None:
+            depth_raw = np.asarray(depth_raw, dtype=np.float32) * float(cfg.depth_scale)
+            valid_depth = np.isfinite(depth_raw) & (depth_raw > 0.0)
+            if step == 0 and np.any(valid_depth):
+                logging.info(
+                    "DA depth stats after depth_scale=%.4f: min=%.4f median=%.4f max=%.4f is_metric=%s scale_factor=%s",
+                    cfg.depth_scale,
+                    float(np.nanmin(depth_raw[valid_depth])),
+                    float(np.nanmedian(depth_raw[valid_depth])),
+                    float(np.nanmax(depth_raw[valid_depth])),
+                    da_out.get("is_metric") if da_out else None,
+                    da_out.get("scale_factor") if da_out else None,
+                )
         depth_vis = draw_depth_image(depth_raw)
         if mask is not None:
             log_aux_image(scene, cfg.camera_name, mask_path, ensure_bgr_image(mask))
@@ -519,76 +657,11 @@ def main(cfg: Config) -> None:
         if pose is not None:
             calibration = dream_camera_calibration(k_orig, pose, w, h)
             calibration["extrinsics"] = pose
-        print("depth raw shape", depth_raw.shape if depth_raw is not None else None)
         if depth_raw is not None and calibration is not None:
             depth_intr = first_array(da_out.get("intrinsics") if da_out else None)
-            print("viewer depth_raw shape", depth_raw.shape)
-            print("viewer da_out intrinsics raw", da_out.get("intrinsics") if da_out else None)
             if depth_intr is None:
-                print("viewer hitting depth_intr fallback")
                 dh, dw = depth_raw.shape
                 depth_intr = scale_intrinsics(k_orig, dw / float(w), dh / float(h))
-                print("viewer fallback depth_intr", depth_intr)
-            else:
-                print("viewer using DA3 depth_intr", depth_intr)
-            print("da3 is_metric", da_out.get("is_metric") if da_out else None)
-            print("da3 scale_factor", da_out.get("scale_factor") if da_out else None)
-            print("depth min / max", np.nanmin(depth_raw), np.nanmax(depth_raw))
-            print("dream w2c", dream_pose)
-            if ht_payload is not None:
-                print("precomputed HT", ht_payload)
-                print("precomputed HT rerun extrinsics", ht_rerun_pose)
-            print("dream pnp reproj", out.get("pnp_reproj_px") if out else None)
-            print("dream mask_iou", out.get("mask_iou") if out else None)
-
-            keypoints = out.get("keypoints") if out else None
-            if keypoints is not None and pose is not None:
-                kps = np.asarray(keypoints)
-                while kps.ndim > 2 and kps.shape[0] == 1:
-                    kps = kps[0]
-                print("dream keypoint net", kps)
-
-                pts_cam = None
-                try:
-                    crossformer_root = Path.home() / "crossformer"
-                    if crossformer_root.exists() and str(crossformer_root) not in sys.path:
-                        sys.path.insert(0, str(crossformer_root))
-                    from crossformer.utils.callbacks.synth_viz import fk_keypoints
-
-                    q_deg = np.asarray(cfg.q, dtype=np.float64)
-                    joints_rad = np.deg2rad(q_deg[:7])
-                    pts_world = fk_keypoints(joints_rad)
-                    pts_cam = (pose[:3, :3] @ pts_world.T).T + pose[:3, 3]
-                    print("dream expected kp camera z", pts_cam[:, 2])
-                except (ImportError, ModuleNotFoundError) as exc:
-                    print("could not import fk_keypoints for depth compare", exc)
-
-                sx = depth_raw.shape[1] / float(cfg.image_size)
-                sy = depth_raw.shape[0] / float(cfg.image_size)
-                for i, uv in enumerate(kps):
-                    if uv[0] < -900:
-                        continue
-                    x = round(float(uv[0]) * sx)
-                    y = round(float(uv[1]) * sy)
-                    if 0 <= x < depth_raw.shape[1] and 0 <= y < depth_raw.shape[0]:
-                        da_z = float(depth_raw[y, x])
-                        if pts_cam is not None and i < len(pts_cam):
-                            dream_z = float(pts_cam[i, 2])
-                            print(
-                                "kp depth compare",
-                                i,
-                                "px",
-                                x,
-                                y,
-                                "da_z",
-                                da_z,
-                                "dream_z",
-                                dream_z,
-                                "ratio",
-                                da_z / dream_z,
-                            )
-                        else:
-                            print("kp depth", i, "px", x, y, "da_z", da_z)
             try:
                 points_cam, colors_rgb = unproject_depth_points(
                     depth_raw,
@@ -651,7 +724,8 @@ def main(cfg: Config) -> None:
 
         step += 1
 
-    cap.release()
+    if cap is not None:
+        cap.release()
     cv2.destroyAllWindows()
 
 
