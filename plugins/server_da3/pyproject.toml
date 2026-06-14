@@ -1,3 +1,8 @@
+[build-system]
+requires = ["torch". "setuptools"]
+# requires = ["uv_build>=0.9.15"]
+# build-backend = "uv_build"
+
 [project]
 name = "server-da3"
 version = "0.1.0"
